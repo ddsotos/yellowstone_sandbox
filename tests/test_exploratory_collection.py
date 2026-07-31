@@ -69,7 +69,7 @@ def test_card_first_hand_six_still_selects_only_zero_loss() -> None:
     assert choice.groups_examined > 0
 
 
-def test_card_first_fallback_matches_existing_baseline() -> None:
+def test_card_first_mode_remains_distinct_for_low_hand_randomization() -> None:
     state = create_initial_state(4, seed=13)
     player = state.players[0]
     state = replace(
@@ -86,7 +86,8 @@ def test_card_first_fallback_matches_existing_baseline() -> None:
     old_choice = old.choose_turn(state, (), rng=Random(11))
     fast_choice = fast.choose_turn(state, (), rng=Random(11))
 
-    assert old_choice.selection_mode == fast_choice.selection_mode == "baseline_v1"
+    assert old_choice.selection_mode == "random_safe_two"
+    assert fast_choice.selection_mode == "random_safe_two"
     assert old_choice.actions == fast_choice.actions
 
 

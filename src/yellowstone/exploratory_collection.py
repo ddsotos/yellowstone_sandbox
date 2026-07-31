@@ -57,7 +57,14 @@ from yellowstone.value_policy import (
 
 POLICY_NAME = "diverse_hand_conditioned_exploration_v1"
 POLICY_NAME_CARD_FIRST = "diverse_hand_conditioned_exploration_card_first_v2"
-ONE_CARD_PROBABILITY_BY_HAND = {6: 0.30, 5: 0.10}
+ONE_CARD_PROBABILITY_BY_HAND = {
+    6: 0.30,
+    5: 0.10,
+    4: 0.10,
+    3: 0.10,
+    2: 0.10,
+    1: 0.10,
+}
 RANDOM_TWO_WHEN_NO_SAFE_ONE_PROBABILITY = 0.20
 LOW_HAND_NO_REFILL_PROBABILITY = 0.10
 EMPTY_HAND_DECK_REFILL_PROBABILITY = 0.10
@@ -227,10 +234,7 @@ class ExploratoryValueNpc:
                         safe_one=safe_one, safe_two=safe_two,
                         enumeration_seconds=enumeration_seconds,
                     )
-            groups = tuple(
-                group for group in pools.two_card_groups
-                if group.negative_card_increase == min_two
-            )
+            groups = pools.two_card_groups
             selected_group, selected = _choose_grouped_candidate(groups, rng=rng)
             return _choice(
                 selected, selected_group, mode="random_min_loss_two",
@@ -376,7 +380,7 @@ class ExploratoryValueNpc:
                     selected = materialize_turn_candidate(state, actions, history=history)
                     group = _materialized_action_group(action_group, selected)
                     return _choice(selected, group, mode="heuristic_min_loss_one", probability=0.64, draw=branch_draw, pools=pools, safe_one=safe_one, safe_two=safe_two, enumeration_seconds=monotonic() - started)
-            groups = tuple(group for group in pools.two_card_groups if group.negative_card_increase == min_two)
+            groups = pools.two_card_groups
             action_group = rng.choice(groups)
             actions = rng.choice(action_group.outcomes)
             selected = materialize_turn_candidate(state, actions, history=history)
