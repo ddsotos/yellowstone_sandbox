@@ -1,0 +1,13 @@
+data/
+logs/
+results/
+models/*
+!models/win_value_v1_original_generation0_197800_epoch002.pt
+__pycache__/
+.pytest_cache/
+.test-tmp-fast-enum/
+.test-tmp-cloud/
+.venv/
+*.pyc
+*.tmp
+cloud/artifacts/

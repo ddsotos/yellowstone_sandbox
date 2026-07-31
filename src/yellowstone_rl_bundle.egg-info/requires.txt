@@ -1,0 +1,14 @@
+
+[cnn]
+numpy>=2.0
+torch>=2.0
+
+[dev]
+pytest>=8
+
+[tensor]
+numpy>=2.0
+
+[value]
+numpy>=2.0
+torch>=2.0

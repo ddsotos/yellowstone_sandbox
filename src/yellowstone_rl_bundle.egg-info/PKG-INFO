@@ -1,0 +1,82 @@
+Metadata-Version: 2.4
+Name: yellowstone-rl-bundle
+Version: 0.1.0
+Summary: Self-contained Yellowstone Park reinforcement-learning reference bundle.
+Requires-Python: >=3.13
+Description-Content-Type: text/markdown
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
+Provides-Extra: tensor
+Requires-Dist: numpy>=2.0; extra == "tensor"
+Provides-Extra: cnn
+Requires-Dist: numpy>=2.0; extra == "cnn"
+Requires-Dist: torch>=2.0; extra == "cnn"
+Provides-Extra: value
+Requires-Dist: numpy>=2.0; extra == "value"
+Requires-Dist: torch>=2.0; extra == "value"
+
+# Yellowstone RL Bundle
+
+This directory is a self-contained, minimal Python package for Yellowstone Park
+reinforcement-learning research. It contains the rule engine, fixed action space,
+observations, heuristic opponent, rendering, serialization, and reference spatial
+encoders. It deliberately excludes LLM clients, experiment runners, trained models,
+and score-aware research code.
+
+## Setup
+
+From this directory:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\python -m pip install -e ".[dev]"
+.venv\Scripts\python -m pytest
+```
+
+Optional tensor and CNN tests require:
+
+```powershell
+.venv\Scripts\python -m pip install -e ".[cnn]"
+```
+
+## Heuristic win-value pilot
+
+Collect the initial 10,000-game, all-heuristic dataset and train the
+player-perspective win-value CNN:
+
+```powershell
+.venv\Scripts\python -m pip install -e ".[value]"
+.venv\Scripts\python -m yellowstone.value_learning --games 10000 --output heuristic_value_data.npz
+.venv\Scripts\python -m yellowstone.train_value --data heuristic_value_data.npz --checkpoint win_value.pt
+```
+
+The archive contains one record for every completed player turn.  It keeps
+only public board/player counts, the evaluating player's own hand, and the
+two latest public card placements.  Train/validation/test are split by game,
+not by individual record.  `yellowstone.value_policy.choose_highest_value_turn`
+evaluates legal one-card-end and two-card-refill-boundary candidates once a
+trained estimator is supplied.
+
+The package uses `src/` layout. Running `pytest` from `rl_bundle/` tests only the
+copied runtime and the reference modules.
+
+## Included APIs
+
+- `yellowstone.game`: immutable `GameState -> legal_actions -> apply_action` rules.
+- `yellowstone.action_space`: fixed placement/end/refill action indexes and masks.
+- `yellowstone.env`: learner player 0 against deterministic heuristic NPCs.
+- `yellowstone.board_tensor`: spatial board and global-feature encoders.
+- `yellowstone.symmetry`: color permutation and horizontal reflection only.
+- `yellowstone.cnn`: optional PyTorch policy/value reference network.
+
+`symmetry.py` intentionally rejects vertical reflections and 90-degree rotations.
+Ranks map to board y-coordinates, so those transforms are not established game
+symmetries. Placement action indices are transformed through the selected card after
+the transformed hand is sorted; callers must not copy hand indexes directly.
+
+## Provenance
+
+`MANIFEST.sha256` lists each source, documentation, test, and configuration file
+(except the manifest itself) with its SHA-256 digest. Runtime and baseline tests
+were copied from the repository at bundle creation; `board_tensor.py`,
+`symmetry.py`, `cnn.py`, and their tests are new reference implementations.
