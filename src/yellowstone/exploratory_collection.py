@@ -170,7 +170,7 @@ class ExploratoryValueNpc:
                 enumeration_seconds=enumeration_seconds,
             )
 
-        if not safe_one and pools.two_card_groups:
+        if not safe_one and not safe_two and pools.two_card_groups:
             draw = rng.random()
             if draw < RANDOM_TWO_WHEN_NO_SAFE_ONE_PROBABILITY:
                 selected_group, selected = _choose_grouped_candidate(
@@ -189,6 +189,55 @@ class ExploratoryValueNpc:
                     safe_two=safe_two,
                     enumeration_seconds=enumeration_seconds,
                 )
+            min_one = min(
+                group.negative_card_increase for group in pools.one_card_groups
+            ) if pools.one_card_groups else None
+            min_two = min(
+                group.negative_card_increase for group in pools.two_card_groups
+            )
+            if min_one is not None and min_one == min_two:
+                groups = tuple(
+                    group for group in pools.two_card_groups
+                    if group.negative_card_increase == min_two
+                )
+                selected_group, selected = _choose_grouped_candidate(
+                    groups, rng=rng
+                )
+                return _choice(
+                    selected, selected_group, mode="random_min_loss_two_equal",
+                    probability=0.8, draw=draw, pools=pools,
+                    safe_one=safe_one, safe_two=safe_two,
+                    enumeration_seconds=enumeration_seconds,
+                )
+            branch_draw = rng.random()
+            if min_one is not None and branch_draw < 0.8:
+                groups = tuple(
+                    group for group in pools.one_card_groups
+                    if group.negative_card_increase == min_one
+                )
+                candidates = tuple(
+                    candidate for group in groups for candidate in group.candidates
+                )
+                selected = _heuristic_representative(state, candidates)
+                if selected is not None:
+                    selected_group = _find_group_for_candidate(pools, selected)
+                    return _choice(
+                        selected, selected_group, mode="heuristic_min_loss_one",
+                        probability=0.64, draw=branch_draw, pools=pools,
+                        safe_one=safe_one, safe_two=safe_two,
+                        enumeration_seconds=enumeration_seconds,
+                    )
+            groups = tuple(
+                group for group in pools.two_card_groups
+                if group.negative_card_increase == min_two
+            )
+            selected_group, selected = _choose_grouped_candidate(groups, rng=rng)
+            return _choice(
+                selected, selected_group, mode="random_min_loss_two",
+                probability=0.16, draw=branch_draw, pools=pools,
+                safe_one=safe_one, safe_two=safe_two,
+                enumeration_seconds=enumeration_seconds,
+            )
 
         inference_started = monotonic()
         baseline_candidates = _baseline_candidates(state, pools)
@@ -284,7 +333,7 @@ class ExploratoryValueNpc:
                 enumeration_seconds=monotonic() - started,
             )
 
-        if not safe_one and pools.two_card_groups:
+        if not safe_one and not safe_two and pools.two_card_groups:
             draw = rng.random()
             if draw < RANDOM_TWO_WHEN_NO_SAFE_ONE_PROBABILITY:
                 action_group = rng.choice(pools.two_card_groups)
@@ -308,6 +357,31 @@ class ExploratoryValueNpc:
                     safe_two=safe_two,
                     enumeration_seconds=monotonic() - started,
                 )
+            min_one = min((group.negative_card_increase for group in pools.one_card_groups), default=None)
+            min_two = min(group.negative_card_increase for group in pools.two_card_groups)
+            if min_one is not None and min_one == min_two:
+                groups = tuple(group for group in pools.two_card_groups if group.negative_card_increase == min_two)
+                action_group = rng.choice(groups)
+                actions = rng.choice(action_group.outcomes)
+                selected = materialize_turn_candidate(state, actions, history=history)
+                group = _materialized_action_group(action_group, selected)
+                return _choice(selected, group, mode="random_min_loss_two_equal", probability=0.8, draw=draw, pools=pools, safe_one=safe_one, safe_two=safe_two, enumeration_seconds=monotonic() - started)
+            branch_draw = rng.random()
+            if min_one is not None and branch_draw < 0.8:
+                groups = tuple(group for group in pools.one_card_groups if group.negative_card_increase == min_one)
+                outcomes = tuple(actions for group in groups for actions in group.outcomes)
+                actions = _heuristic_action_representative(state, outcomes)
+                if actions is not None:
+                    action_group = next(group for group in groups if actions in group.outcomes)
+                    selected = materialize_turn_candidate(state, actions, history=history)
+                    group = _materialized_action_group(action_group, selected)
+                    return _choice(selected, group, mode="heuristic_min_loss_one", probability=0.64, draw=branch_draw, pools=pools, safe_one=safe_one, safe_two=safe_two, enumeration_seconds=monotonic() - started)
+            groups = tuple(group for group in pools.two_card_groups if group.negative_card_increase == min_two)
+            action_group = rng.choice(groups)
+            actions = rng.choice(action_group.outcomes)
+            selected = materialize_turn_candidate(state, actions, history=history)
+            group = _materialized_action_group(action_group, selected)
+            return _choice(selected, group, mode="random_min_loss_two", probability=0.16, draw=branch_draw, pools=pools, safe_one=safe_one, safe_two=safe_two, enumeration_seconds=monotonic() - started)
 
         baseline_candidates = []
         for groups in (pools.one_card_groups, pools.two_card_groups):
