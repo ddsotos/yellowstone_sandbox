@@ -91,16 +91,24 @@ class ExploratoryValueNpc:
 
     def __init__(
         self,
-        checkpoint: str | Path,
+        checkpoint: str | Path | None,
         *,
         card_first: bool = False,
         lazy_single_pass: bool = False,
+        heuristic_only: bool = False,
     ):
-        self.checkpoint = str(checkpoint)
-        self.checkpoint_sha256 = file_sha256(checkpoint)
-        self.estimator = TorchWinValueEstimator(str(checkpoint))
+        self.checkpoint = str(checkpoint) if checkpoint is not None else ""
+        self.checkpoint_sha256 = (
+            file_sha256(checkpoint) if checkpoint is not None else ""
+        )
+        self.estimator = (
+            None
+            if heuristic_only
+            else TorchWinValueEstimator(str(checkpoint))
+        )
         self.card_first = card_first
         self.lazy_single_pass = lazy_single_pass
+        self.heuristic_only = heuristic_only
 
     def choose_turn(
         self,
@@ -186,8 +194,12 @@ class ExploratoryValueNpc:
         baseline_candidates = _baseline_candidates(state, pools)
         if not baseline_candidates:
             raise RuntimeError("exploratory NPC found no turn candidate")
-        scores = self.estimator.estimate_many(
-            tuple(candidate.record for candidate in baseline_candidates)
+        scores = (
+            tuple(0.0 for _ in baseline_candidates)
+            if getattr(self, "heuristic_only", False) or (safe_one and not safe_two)
+            else self.estimator.estimate_many(
+                tuple(candidate.record for candidate in baseline_candidates)
+            )
         )
         selected_index = max(
             range(len(baseline_candidates)), key=lambda index: scores[index]
@@ -198,7 +210,11 @@ class ExploratoryValueNpc:
         return _choice(
             selected,
             selected_group,
-            mode="baseline_v1",
+            mode=(
+                "heuristic_only"
+                if getattr(self, "heuristic_only", False) or (safe_one and not safe_two)
+                else "baseline_v1"
+            ),
             probability=(
                 RANDOM_TWO_WHEN_NO_SAFE_ONE_PROBABILITY
                 if not safe_one and pools.two_card_groups
@@ -318,8 +334,12 @@ class ExploratoryValueNpc:
             )
         enumeration_seconds = monotonic() - started
         inference_started = monotonic()
-        scores = self.estimator.estimate_many(
-            tuple(candidate.record for candidate in baseline_candidates)
+        scores = (
+            tuple(0.0 for _ in baseline_candidates)
+            if getattr(self, "heuristic_only", False) or (safe_one and not safe_two)
+            else self.estimator.estimate_many(
+                tuple(candidate.record for candidate in baseline_candidates)
+            )
         )
         selected_index = max(
             range(len(baseline_candidates)), key=lambda index: scores[index]
@@ -343,7 +363,11 @@ class ExploratoryValueNpc:
         return _choice(
             selected,
             group,
-            mode="baseline_v1",
+            mode=(
+                "heuristic_only"
+                if getattr(self, "heuristic_only", False) or (safe_one and not safe_two)
+                else "baseline_v1"
+            ),
             probability=(
                 RANDOM_TWO_WHEN_NO_SAFE_ONE_PROBABILITY
                 if not safe_one and pools.two_card_groups
@@ -467,8 +491,12 @@ class ExploratoryValueNpc:
             raise RuntimeError("card-first NPC found no baseline candidate")
         enumeration_seconds = monotonic() - started
         inference_started = monotonic()
-        scores = self.estimator.estimate_many(
-            tuple(candidate.record for candidate in baseline_candidates)
+        scores = (
+            tuple(0.0 for _ in baseline_candidates)
+            if getattr(self, "heuristic_only", False)
+            else self.estimator.estimate_many(
+                tuple(candidate.record for candidate in baseline_candidates)
+            )
         )
         selected_index = max(
             range(len(baseline_candidates)), key=lambda index: scores[index]
@@ -478,7 +506,11 @@ class ExploratoryValueNpc:
         return _card_first_choice(
             selected,
             group,
-            mode="baseline_v1",
+            mode=(
+                "heuristic_only"
+                if getattr(self, "heuristic_only", False)
+                else "baseline_v1"
+            ),
             probability=(
                 RANDOM_TWO_WHEN_NO_SAFE_ONE_PROBABILITY
                 if safe_one is None and two_keys
@@ -967,7 +999,7 @@ def play_one_exploratory_game(
 
 
 def collect_exploratory(
-    checkpoint: str | Path,
+    checkpoint: str | Path | None,
     *,
     seed: int,
     game_id_offset: int,
@@ -978,6 +1010,7 @@ def collect_exploratory(
     max_games: int | None = None,
     card_first: bool = False,
     lazy_single_pass: bool = False,
+    heuristic_only: bool = False,
 ) -> dict[str, Any]:
     if shard_games <= 0 or max_games is not None and max_games <= 0:
         raise ValueError("shard_games and max_games must be positive")
@@ -985,13 +1018,14 @@ def collect_exploratory(
         checkpoint,
         card_first=card_first,
         lazy_single_pass=lazy_single_pass,
+        heuristic_only=heuristic_only,
     )
     output_path = Path(output)
     output_path.mkdir(parents=True, exist_ok=True)
     stop_path = Path(stop_file)
     status_path = Path(status_file) if status_file is not None else None
     manifest_path = output_path / "collection_manifest.json"
-    checkpoint_hash = file_sha256(checkpoint)
+    checkpoint_hash = file_sha256(checkpoint) if checkpoint is not None else ""
     expected = {
         "collector": (
             POLICY_NAME_CARD_FIRST if card_first else POLICY_NAME
@@ -1001,6 +1035,7 @@ def collect_exploratory(
         "shard_games": shard_games,
         "max_games": max_games,
         "checkpoint_sha256": checkpoint_hash,
+        "model_mode": "heuristic_only" if heuristic_only else "checkpoint",
     }
     if card_first:
         expected["card_first"] = True
@@ -1160,7 +1195,7 @@ def _write_collection_status(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--seed", type=int, default=20260730)
     parser.add_argument("--game-id-offset", type=int, default=1_100_912)
     parser.add_argument("--output", type=Path, required=True)
@@ -1170,7 +1205,10 @@ def main() -> None:
     parser.add_argument("--max-games", type=int)
     parser.add_argument("--card-first", action="store_true")
     parser.add_argument("--lazy-single-pass", action="store_true")
+    parser.add_argument("--heuristic-only", action="store_true")
     args = parser.parse_args()
+    if not args.heuristic_only and args.checkpoint is None:
+        parser.error("--checkpoint is required unless --heuristic-only is set")
     result = collect_exploratory(
         args.checkpoint,
         seed=args.seed,
@@ -1182,6 +1220,7 @@ def main() -> None:
         max_games=args.max_games,
         card_first=args.card_first,
         lazy_single_pass=args.lazy_single_pass,
+        heuristic_only=args.heuristic_only,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

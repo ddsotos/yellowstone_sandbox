@@ -11,8 +11,14 @@ mkdir -p "$out"
 cd "$root"
 stop_file="$root/cloud/artifacts/worker_${worker_index}/STOP"
 status_file="$root/cloud/artifacts/worker_${worker_index}/status.json"
+mode_args=()
+if [[ "${HEURISTIC_ONLY:-0}" == "1" ]]; then
+  mode_args+=(--heuristic-only)
+else
+  mode_args+=(--checkpoint models/win_value_v1_original_generation0_197800_epoch002.pt)
+fi
 PYTHONPATH=src python -m yellowstone.exploratory_collection \
-  --checkpoint models/win_value_v1_original_generation0_197800_epoch002.pt \
+  "${mode_args[@]}" \
   --seed "$seed" --game-id-offset "$game_id_offset" \
   --output "$out" --stop-file "$stop_file" --status-file "$status_file" \
   --shard-games 100 --max-games "$max_games" \
