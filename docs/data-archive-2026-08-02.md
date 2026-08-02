@@ -108,3 +108,44 @@ Do not move any dataset named in a running status JSON as `source`, `data`, or
 current conversion output. Once the relevant pipeline has completed and no live
 PID references the dataset, derived tensors and raw replay that are not needed
 for near-term comparison can be moved under `D:\codex-backup`.
+
+## Continuous Variant Chunk Training
+
+The continuous variant replay collection can be trained in retained 200,000-game
+increments with:
+
+```powershell
+.\scripts\run_continuous_variant_chunk_training.ps1
+```
+
+Status:
+`rl_bundle\results\evaluations\v2_variant_board5_hand6_oneoff_tiered_continuous_chunk_training.status.json`
+
+Stop file:
+`rl_bundle\results\evaluations\v2_variant_board5_hand6_oneoff_tiered_continuous_chunk_training.stop`
+
+For each cumulative threshold, the pipeline writes a fixed snapshot and derived
+tensors:
+
+- `data\v2_variant_board5_hand6_oneoff_tiered_continuous_chunk_training_0200000_snapshot`
+- `data\v2_variant_board5_hand6_oneoff_tiered_continuous_chunk_training_0200000_canonical`
+- `data\v2_variant_board5_hand6_oneoff_tiered_continuous_chunk_training_0200000_board_columns_v1`
+- `data\v2_variant_board5_hand6_oneoff_tiered_continuous_chunk_training_0200000_preplay_board_columns`
+
+The next thresholds use the same naming pattern with `0400000`, `0600000`, and
+so on. These datasets are intentionally retained so each 200,000-game training
+point can be inspected, reused, or archived later.
+
+For each threshold, three training jobs are run with at most two concurrent
+training processes:
+
+- `board_columns_v1_scratch`: random initialization on that threshold's retained
+  board-columns tensor.
+- `board_columns_v1_finetune`: first threshold starts from the 6-hour
+  board_columns_v1 checkpoint; later thresholds continue from the previous
+  threshold's finetuned checkpoint when available.
+- `preplay_board_columns`: random initialization on the retained pre-play
+  board-columns tensor.
+
+When no new 200,000-game threshold is available, the watcher waits one hour and
+checks the continuous collection manifest again.
