@@ -34,6 +34,8 @@ class ValueTurnPlayer:
     current_turn_history_only: bool = False
     one_card_win_probability_boost_percent: float = 0.0
     history: list[RecentPlacement] = field(default_factory=list)
+    board_center_frame_history: list[tuple[int, int]] = field(default_factory=list)
+    board_center_chain_states: list[GameState] = field(default_factory=list)
     pruning_records: list[tuple[str, GameState, TurnSelection]] = field(default_factory=list)
     selections: list[TurnSelection] = field(default_factory=list)
     _remaining_plan: list[Action] = field(default_factory=list)
@@ -73,6 +75,8 @@ class ValueTurnPlayer:
                     if self.current_turn_history_only
                     else tuple(self.history)
                 ),
+                board_center_frame_history=tuple(self.board_center_frame_history),
+                board_center_chain_states=tuple(self.board_center_chain_states),
                 prune_negative_card_increase_above=limit,
                 approximate_new_color_neighbor_limit=self.approximate_new_color_neighbor_limit,
                 one_card_win_probability_boost_percent=(
@@ -92,6 +96,22 @@ class ValueTurnPlayer:
 
     def observe(self, before: GameState, action: Action, after: GameState) -> None:
         """Record each public placement, including opponent placements."""
+        if (
+            before.current_player_index == self.player_index
+            and isinstance(action, EndTurnAction)
+            and before.cards_played_this_turn == 1
+        ):
+            from yellowstone.value_board_centered import board_center_frame_origin
+
+            try:
+                self.board_center_frame_history.append(
+                    board_center_frame_origin(after)
+                )
+                del self.board_center_frame_history[:-HISTORY_SIZE]
+                self.board_center_chain_states.append(after)
+                del self.board_center_chain_states[:-12]
+            except ValueError:
+                pass
         if not isinstance(action, PlaceCardAction):
             return
         player_index = before.current_player_index
@@ -111,6 +131,20 @@ class ValueTurnPlayer:
             )
         )
         del self.history[:-HISTORY_SIZE]
+        if before.current_player_index == self.player_index and (
+            before.cards_played_this_turn == 1
+        ):
+            from yellowstone.value_board_centered import board_center_frame_origin
+
+            try:
+                self.board_center_frame_history.append(
+                    board_center_frame_origin(after)
+                )
+                del self.board_center_frame_history[:-HISTORY_SIZE]
+                self.board_center_chain_states.append(after)
+                del self.board_center_chain_states[:-12]
+            except ValueError:
+                pass
 
 
 @dataclass(frozen=True, slots=True)

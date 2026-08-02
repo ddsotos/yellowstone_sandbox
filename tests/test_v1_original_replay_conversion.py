@@ -11,6 +11,7 @@ from yellowstone.convert_replay_v2_to_v1_original import (
     HISTORY_SEMANTICS_V1_ORIGINAL,
     VALUE_SCHEMA_V1_ORIGINAL,
     convert_replay_shards as convert_original,
+    records_from_replay_v1_refill_count,
     records_from_replay_v1_original,
 )
 from yellowstone.game import apply_known_legal_action, create_initial_state
@@ -22,6 +23,13 @@ from yellowstone.replay_v2 import (
 )
 from yellowstone.types import Phase
 from yellowstone.value_learning import split_game_ids
+from yellowstone.value_refill_count import (
+    CANONICALIZATION_REFILL_COUNT,
+    CANONICALIZATION_REFILL_COUNT_SCALAR,
+    REFILL_COUNT_CLASSES,
+    VALUE_CONTEXT_SIZE_REFILL_COUNT,
+    VALUE_CONTEXT_SIZE_REFILL_COUNT_SCALAR,
+)
 
 
 def _heuristic_replay(
@@ -218,3 +226,79 @@ def test_original_conversion_rebases_contiguous_game_ids(tmp_path) -> None:
             archive["game_id"], archive["source_game_id"] - 17
         )
         assert set(archive["perspective_player_index"]) <= {0, 1, 2, 3}
+
+
+def test_original_refill_count_records_match_original_contract() -> None:
+    game = _heuristic_replay(0, initial_seed=23, gameplay_seed=1023)
+
+    original = records_from_replay_v1_original(game)
+    refill_count = records_from_replay_v1_refill_count(game)
+
+    assert len(refill_count) == len(original)
+    assert any(record.refill_count > 0 for record in refill_count)
+    assert all(0 <= record.refill_count < REFILL_COUNT_CLASSES for record in refill_count)
+    for actual, expected in zip(refill_count, original, strict=True):
+        assert actual.game_id == expected.game_id
+        assert actual.perspective_player_index == expected.perspective_player_index
+        assert actual.state == expected.state
+        assert actual.history == expected.history
+        assert actual.target == expected.target
+
+
+def test_original_refill_count_conversion_appends_one_hot_context(tmp_path) -> None:
+    games = (
+        _heuristic_replay(17, initial_seed=23, gameplay_seed=1023),
+        _heuristic_replay(18, initial_seed=31, gameplay_seed=41),
+    )
+    source = tmp_path / "replays"
+    source.mkdir()
+    write_replay_shard(games, source / "part_000017.jsonl.gz")
+
+    manifest = convert_original(
+        source,
+        tmp_path / "refill_count",
+        expected_games=2,
+        game_id_rebase=17,
+        expected_source_game_id_min=17,
+        expected_source_game_id_max=18,
+        input_canonicalization=CANONICALIZATION_REFILL_COUNT,
+    )
+
+    assert manifest["input_canonicalization"] == CANONICALIZATION_REFILL_COUNT
+    assert manifest["refill_count_classes"] == REFILL_COUNT_CLASSES
+    with np.load(tmp_path / "refill_count" / "part_000017.npz") as archive:
+        context = archive["context"]
+        refill_encoding = context[:, -REFILL_COUNT_CLASSES:]
+        assert context.shape[1] == VALUE_CONTEXT_SIZE_REFILL_COUNT
+        assert np.allclose(refill_encoding.sum(axis=1), 1.0)
+        assert np.any(np.argmax(refill_encoding, axis=1) > 0)
+
+
+def test_original_refill_count_scalar_conversion_appends_numeric_context(tmp_path) -> None:
+    games = (
+        _heuristic_replay(17, initial_seed=23, gameplay_seed=1023),
+        _heuristic_replay(18, initial_seed=31, gameplay_seed=41),
+    )
+    source = tmp_path / "replays"
+    source.mkdir()
+    write_replay_shard(games, source / "part_000017.jsonl.gz")
+
+    manifest = convert_original(
+        source,
+        tmp_path / "refill_count_scalar",
+        expected_games=2,
+        game_id_rebase=17,
+        expected_source_game_id_min=17,
+        expected_source_game_id_max=18,
+        input_canonicalization=CANONICALIZATION_REFILL_COUNT_SCALAR,
+    )
+
+    assert manifest["input_canonicalization"] == CANONICALIZATION_REFILL_COUNT_SCALAR
+    assert manifest["refill_count_features"] == 1
+    assert manifest["refill_count_encoding"] == "scalar_count_divided_by_6"
+    with np.load(tmp_path / "refill_count_scalar" / "part_000017.npz") as archive:
+        context = archive["context"]
+        refill_scalar = context[:, -1]
+        assert context.shape[1] == VALUE_CONTEXT_SIZE_REFILL_COUNT_SCALAR
+        assert np.all((0.0 <= refill_scalar) & (refill_scalar <= 1.0))
+        assert np.any(refill_scalar > 0.0)

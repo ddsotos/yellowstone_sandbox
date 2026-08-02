@@ -44,6 +44,22 @@ def _privileged_record(state):
     )
 
 
+def test_recorded_safe_one_counts_are_used_without_reenumeration() -> None:
+    state = create_initial_state(4, seed=7)
+    record = PrivilegedStateRecord(
+        game_id=1,
+        state=state,
+        history=(),
+        target=(0.25, 0.25, 0.25, 0.25),
+        safe_one_card_counts=(0, 1, 2, 3),
+    )
+    _, context = encode_privileged_state(record)
+    # Each player block ends with the recorded count, relative to current.
+    assert np.allclose(
+        context[[41, 84, 127, 170]], np.asarray((0, 1, 2, 3)) / 6
+    )
+
+
 def test_privileged_state_shapes_and_four_output_distribution() -> None:
     record = _privileged_record(create_initial_state(4, seed=7))
     board, context = encode_privileged_state(record)

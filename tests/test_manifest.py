@@ -3,6 +3,7 @@ from pathlib import Path
 
 
 EXCLUDED_PARTS = {
+    ".git",
     ".venv",
     ".pytest_cache",
     ".test-tmp-fast-enum",
@@ -11,6 +12,7 @@ EXCLUDED_PARTS = {
     "logs",
     "models",
     "results",
+    "tmp",
 }
 
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from functools import cache
 from random import Random
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from yellowstone.types import (
     BOARD_SIZE,
@@ -130,10 +130,20 @@ def frames_containing(position: Position) -> tuple[Frame, ...]:
 
 def board_fits_in_some_frame(board: Board) -> bool:
     """Return whether all occupied cells fit together in at least one frame."""
-    occupied = set(board)
-    if not occupied:
+    positions = board.keys()
+    if not positions:
         return True
-    return any(occupied <= frame_positions(frame) for frame in all_frames())
+
+    min_x = min(position.x for position in positions)
+    max_x = max(position.x for position in positions)
+    min_y = min(position.y for position in positions)
+    max_y = max(position.y for position in positions)
+    return (
+        0 <= min_x <= max_x < BOARD_SIZE
+        and 0 <= min_y <= max_y < BOARD_SIZE
+        and max_x - min_x < FRAME_SIZE
+        and max_y - min_y < FRAME_SIZE
+    )
 
 
 def legal_actions(state: GameState) -> tuple[Action, ...]:
@@ -158,8 +168,9 @@ def legal_actions(state: GameState) -> tuple[Action, ...]:
     # turn, but it occurs before any card has been played this turn.
     if not player.hand and state.cards_played_this_turn == 0:
         return _legal_refill_actions(state)
+    color_columns, column_colors = _placement_index(state.board)
     for hand_index, card in enumerate(player.hand):
-        for position in legal_positions_for_card(state.board, card):
+        for position in _legal_positions_from_index(card, color_columns, column_colors):
             for frame in frames_containing(position):
                 actions.append(
                     PlaceCardAction(
@@ -173,10 +184,46 @@ def legal_actions(state: GameState) -> tuple[Action, ...]:
 
 def legal_positions_for_card(board: Board, card: Card) -> tuple[Position, ...]:
     """Return legal board positions for a card before frame selection."""
+    return _legal_positions_from_index(card, *_placement_index(board))
+
+
+def _legal_positions_from_index(
+    card: Card,
+    color_columns: Mapping[Color, frozenset[int]],
+    column_colors: tuple[frozenset[Color], ...],
+) -> tuple[Position, ...]:
+    """Return legal positions using a precomputed summary of the board."""
+    existing_columns = color_columns.get(card.color)
+    if existing_columns:
+        return tuple(
+            Position(x=x, y=card.rank_index)
+            for x in sorted(existing_columns)
+            if 0 <= x < BOARD_SIZE
+        )
     return tuple(
-        position
-        for position in (Position(x=x, y=card.rank_index) for x in range(BOARD_SIZE))
-        if can_place_card_at(board, card, position)
+        Position(x=x, y=card.rank_index)
+        for x, colors in enumerate(column_colors)
+        if not colors or colors == {card.color}
+    )
+
+
+def _placement_index(
+    board: Board,
+) -> tuple[dict[Color, frozenset[int]], tuple[frozenset[Color], ...]]:
+    """Summarize board colors once for repeated placement checks."""
+    columns_by_color: dict[Color, set[int]] = {}
+    colors_by_column = [set() for _ in range(BOARD_SIZE)]
+    for position, stack in board.items():
+        for card in stack:
+            columns_by_color.setdefault(card.color, set()).add(position.x)
+            if 0 <= position.x < BOARD_SIZE:
+                colors_by_column[position.x].add(card.color)
+    return (
+        {
+            color: frozenset(columns)
+            for color, columns in columns_by_color.items()
+        },
+        tuple(frozenset(colors) for colors in colors_by_column),
     )
 
 
@@ -457,10 +504,10 @@ def _remove_at(cards: tuple[Card, ...], index: int) -> tuple[Card, ...]:
 
 
 def _draw_from_list(cards: list[Card], count: int) -> tuple[Card, ...]:
-    drawn: list[Card] = []
-    for _ in range(min(count, len(cards))):
-        drawn.append(cards.pop(0))
-    return tuple(drawn)
+    draw_count = min(count, len(cards))
+    drawn = tuple(cards[:draw_count])
+    del cards[:draw_count]
+    return drawn
 
 
 def _flatten_board_cards(board: Board) -> Iterable[Card]:

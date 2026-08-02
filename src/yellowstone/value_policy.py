@@ -7,6 +7,7 @@ from itertools import combinations
 from math import isfinite
 from typing import Callable
 
+from yellowstone.bots import HeuristicBot
 from yellowstone.game import (
     all_frames,
     apply_known_legal_action,
@@ -16,7 +17,6 @@ from yellowstone.game import (
     frame_positions,
     frames_containing,
     legal_actions,
-    occupied_count_in_frame,
 )
 from yellowstone.types import (
     Action,
@@ -28,12 +28,20 @@ from yellowstone.types import (
     Phase,
     PlaceCardAction,
     Position,
+    RefillAction,
 )
 from yellowstone.value_learning import (
     HISTORY_SIZE,
     VALUE_CONTEXT_SIZE,
     RecentPlacement,
     ValueRecord,
+)
+from yellowstone.value_refill_count import (
+    CANONICALIZATION_REFILL_COUNT,
+    CANONICALIZATION_REFILL_COUNT_SCALAR,
+    append_refill_count_context,
+    append_refill_count_scalar_context,
+    refill_count_for_action,
 )
 
 
@@ -277,6 +285,7 @@ def enumerate_grouped_turn_action_pools(
         ],
     ] = {1: {}, 2: {}}
     enumerated = 0
+    best_two_loss: int | None = None
 
     def consider(
         play_count: int,
@@ -285,7 +294,7 @@ def enumerate_grouped_turn_action_pools(
         metric: tuple[int, int],
         public_key: tuple[object, ...],
     ) -> None:
-        nonlocal enumerated
+        nonlocal best_two_loss, enumerated
         enumerated += 1
         ordered_cards = tuple(
             sorted(cards, key=lambda card: (card.color.value, card.rank_index))
@@ -300,6 +309,12 @@ def enumerate_grouped_turn_action_pools(
                 ordered_cards,
                 {public_key: actions},
             )
+            if play_count == 2:
+                best_two_loss = (
+                    metric[0]
+                    if best_two_loss is None
+                    else min(best_two_loss, metric[0])
+                )
         elif metric == existing[0]:
             existing[2].setdefault(public_key, actions)
 
@@ -316,22 +331,25 @@ def enumerate_grouped_turn_action_pools(
             continue
         first_card = starting_player.hand[first.hand_index]
         after_first = apply_known_legal_action(state, first)
-        if EndTurnAction() in legal_actions(after_first):
-            after_end = apply_known_legal_action(
-                after_first, EndTurnAction()
-            )
-            after_end_player = after_end.players[player_index]
-            consider(
-                1,
-                (first_card,),
-                (first, EndTurnAction()),
-                (
-                    len(after_end_player.negative_cards)
-                    - len(starting_player.negative_cards),
-                    after_end_player.loss_score - starting_player.loss_score,
-                ),
-                _turn_public_result_key(after_end, player_index),
-            )
+        after_end = apply_known_legal_action(after_first, EndTurnAction())
+        after_end_player = after_end.players[player_index]
+        consider(
+            1,
+            (first_card,),
+            (first, EndTurnAction()),
+            (
+                len(after_end_player.negative_cards)
+                - len(starting_player.negative_cards),
+                after_end_player.loss_score - starting_player.loss_score,
+            ),
+            _turn_public_result_key(after_end, player_index),
+        )
+        first_loss = (
+            len(after_first.players[player_index].negative_cards)
+            - len(starting_player.negative_cards)
+        )
+        if best_two_loss is not None and first_loss > best_two_loss:
+            continue
         for second in _candidate_actions(
             after_first,
             approximate_new_color_neighbor_limit=(
@@ -505,21 +523,27 @@ def enumerate_loss_safe_turn_pools(
         if not isinstance(first, PlaceCardAction):
             continue
         after_first = apply_known_legal_action(state, first)
-        if EndTurnAction() in legal_actions(after_first):
-            after_end = apply_known_legal_action(
-                after_first, EndTurnAction()
-            )
-            after_end_player = after_end.players[player_index]
-            consider(
-                1,
-                (first, EndTurnAction()),
-                (
-                    len(after_end_player.negative_cards)
-                    - len(starting_player.negative_cards),
-                    after_end_player.loss_score - starting_player.loss_score,
-                ),
-                _turn_public_result_key(after_end, player_index),
-            )
+        after_end = apply_known_legal_action(after_first, EndTurnAction())
+        after_end_player = after_end.players[player_index]
+        consider(
+            1,
+            (first, EndTurnAction()),
+            (
+                len(after_end_player.negative_cards)
+                - len(starting_player.negative_cards),
+                after_end_player.loss_score - starting_player.loss_score,
+            ),
+            _turn_public_result_key(after_end, player_index),
+        )
+        first_loss = (
+            len(after_first.players[player_index].negative_cards)
+            - len(starting_player.negative_cards)
+        )
+        best_two_loss = (
+            best_metrics[2][0] if best_metrics[2] is not None else None
+        )
+        if best_two_loss is not None and first_loss > best_two_loss:
+            continue
         for second in _candidate_actions(
             after_first,
             approximate_new_color_neighbor_limit=(
@@ -577,6 +601,8 @@ def enumerate_turn_end_candidates(
     state: GameState,
     *,
     history: tuple[RecentPlacement, ...] = (),
+    board_center_frame_history: tuple[tuple[int, int], ...] = (),
+    board_center_chain_states: tuple[GameState, ...] = (),
     game_id: int = -1,
     max_negative_card_increase: int | None = None,
     approximate_new_color_neighbor_limit: bool = False,
@@ -597,6 +623,22 @@ def enumerate_turn_end_candidates(
         raise ValueError("max_negative_card_increase must not be negative")
     player_index = state.current_player_index
     initial_negative_count = len(state.players[player_index].negative_cards)
+    refill_chooser = HeuristicBot()
+
+    def refill_count_for_snapshot(
+        snapshot: GameState,
+        snapshot_history: tuple[RecentPlacement, ...],
+    ) -> int:
+        action = (
+            refill_chooser.choose_action(snapshot)
+            if snapshot.phase == Phase.REFILL
+            else None
+        )
+        return refill_count_for_action(
+            ValueRecord(game_id, player_index, snapshot, snapshot_history, 0.0),
+            action if isinstance(action, RefillAction) else None,
+        )
+
     result: list[TurnCandidate] = []
     for first in _candidate_actions(
         state,
@@ -619,7 +661,19 @@ def enumerate_turn_end_candidates(
             result.append(
                 TurnCandidate(
                     actions=(first, EndTurnAction()),
-                    record=ValueRecord(game_id, player_index, after_end, first_history, 0.0),
+                    record=ValueRecord(
+                        game_id,
+                        player_index,
+                        after_end,
+                        first_history,
+                        0.0,
+                        board_center_frame_history=board_center_frame_history,
+                        board_center_chain_states=board_center_chain_states,
+                        refill_count=refill_count_for_snapshot(
+                            after_end,
+                            first_history,
+                        ),
+                    ),
                 )
             )
         for second in _candidate_actions(
@@ -644,7 +698,19 @@ def enumerate_turn_end_candidates(
             result.append(
                 TurnCandidate(
                     actions=(first, second),
-                    record=ValueRecord(game_id, player_index, after_second, second_history, 0.0),
+                    record=ValueRecord(
+                        game_id,
+                        player_index,
+                        after_second,
+                        second_history,
+                        0.0,
+                        board_center_frame_history=board_center_frame_history,
+                        board_center_chain_states=board_center_chain_states,
+                        refill_count=refill_count_for_snapshot(
+                            after_second,
+                            second_history,
+                        ),
+                    ),
                 )
             )
     return tuple(result)
@@ -681,6 +747,8 @@ def select_highest_value_turn(
     estimate: Callable[[ValueRecord], float],
     *,
     history: tuple[RecentPlacement, ...] = (),
+    board_center_frame_history: tuple[tuple[int, int], ...] = (),
+    board_center_chain_states: tuple[GameState, ...] = (),
     prune_negative_card_increase_above: int | None = None,
     approximate_new_color_neighbor_limit: bool = False,
     one_card_win_probability_boost_percent: float = 0.0,
@@ -699,6 +767,8 @@ def select_highest_value_turn(
     candidates = enumerate_turn_end_candidates(
         state,
         history=history,
+        board_center_frame_history=board_center_frame_history,
+        board_center_chain_states=board_center_chain_states,
         max_negative_card_increase=pruning_limit,
         approximate_new_color_neighbor_limit=approximate_new_color_neighbor_limit,
     )
@@ -816,10 +886,12 @@ def _candidate_actions_for_cards(
     player = state.players[state.current_player_index]
     if not player.hand and state.cards_played_this_turn == 0:
         return legal_actions(state)
-    exact_positions = (
-        None
-        if approximate_new_color_neighbor_limit
-        else _exact_legal_positions_by_card(state.board, player.hand)
+    positions_by_card = _candidate_positions_by_card(
+        state.board,
+        player.hand,
+        approximate_new_color_neighbor_limit=(
+            approximate_new_color_neighbor_limit
+        ),
     )
     seen_cards: set[Card] = set()
     for hand_index, card in enumerate(player.hand):
@@ -828,15 +900,7 @@ def _candidate_actions_for_cards(
         if collapse_identical_hand_cards and card in seen_cards:
             continue
         seen_cards.add(card)
-        positions = (
-            exact_positions[hand_index]
-            if exact_positions is not None
-            else _candidate_positions_for_card(
-                state.board,
-                card,
-                approximate_new_color_neighbor_limit=approximate_new_color_neighbor_limit,
-            )
-        )
+        positions = positions_by_card[hand_index]
         for position in positions:
             if collapse_equivalent_frames:
                 actions.extend(
@@ -941,10 +1005,10 @@ def _second_placement_metric_and_key(
     card = player.hand[action.hand_index]
     board = dict(state.board)
     frame_cells = frame_positions(action.frame)
-    occupied_before = occupied_count_in_frame(board, action.frame)
     was_occupied = action.position in board
+    occupied_before = sum(1 for position in board if position in frame_cells)
     board[action.position] = board.get(action.position, ()) + (card,)
-    occupied_after = occupied_count_in_frame(board, action.frame)
+    occupied_after = occupied_before if was_occupied else occupied_before + 1
     received = tuple(
         received_card
         for position, stack in board.items()
@@ -1037,22 +1101,54 @@ def _exact_legal_positions_by_card(
     return tuple(per_card)
 
 
+def _candidate_positions_by_card(
+    board: object,
+    hand: tuple[Card, ...],
+    *,
+    approximate_new_color_neighbor_limit: bool,
+) -> tuple[tuple[Position, ...], ...]:
+    """Return candidate positions with board color facts reused."""
+    if not approximate_new_color_neighbor_limit:
+        return _exact_legal_positions_by_card(board, hand)
+    occupied_columns = {position.x for position in board}
+    empty_columns = frozenset(
+        column for column in range(BOARD_SIZE) if column not in occupied_columns
+    )
+    approximate_columns = _approximate_new_color_columns(board)
+    color_columns_by_color = {
+        color: columns_containing_color(board, color)
+        for color in {card.color for card in hand}
+    }
+    per_card: list[tuple[Position, ...]] = []
+    for card in hand:
+        color_columns = color_columns_by_color[card.color]
+        if color_columns:
+            columns = sorted(color_columns)
+        else:
+            columns = tuple(
+                column
+                for column in approximate_columns
+                if column in empty_columns
+            )
+        per_card.append(
+            tuple(Position(x=column, y=card.rank_index) for column in columns)
+        )
+    return tuple(per_card)
+
+
 def _candidate_positions_for_card(
     board: object,
     card: Card,
     *,
     approximate_new_color_neighbor_limit: bool,
 ) -> tuple[Position, ...]:
-    color_columns = columns_containing_color(board, card.color)
-    if color_columns or not approximate_new_color_neighbor_limit:
-        candidate_columns = range(BOARD_SIZE)
-    else:
-        candidate_columns = _approximate_new_color_columns(board)
-    return tuple(
-        position
-        for position in (Position(x=x, y=card.rank_index) for x in candidate_columns)
-        if can_place_card_at(board, card, position)
-    )
+    return _candidate_positions_by_card(
+        board,
+        (card,),
+        approximate_new_color_neighbor_limit=(
+            approximate_new_color_neighbor_limit
+        ),
+    )[0]
 
 
 def _approximate_new_color_columns(board: object) -> tuple[int, ...]:
@@ -1127,6 +1223,14 @@ class TorchWinValueEstimator:
             context_size=int(
                 checkpoint.get("context_size", VALUE_CONTEXT_SIZE)
             ),
+            board_channels=int(checkpoint.get("board_channels", 29)),
+            board_size=int(checkpoint.get("board_size", 7)),
+            board_height=int(
+                checkpoint.get("board_height", checkpoint.get("board_size", 7))
+            ),
+            board_width=int(
+                checkpoint.get("board_width", checkpoint.get("board_size", 7))
+            ),
         )
         self._model.load_state_dict(checkpoint["state_dict"])
         self._model.eval()
@@ -1157,14 +1261,55 @@ class TorchWinValueEstimator:
                 canonicalize_value_tensors,
             )
 
-            if self._input_canonicalization != CANONICALIZATION_NAME:
-                raise ValueError(
-                    "unsupported value-input canonicalization: "
-                    f"{self._input_canonicalization}"
+            if self._input_canonicalization == CANONICALIZATION_NAME:
+                board_array, context_array = canonicalize_value_tensors(
+                    board_array, context_array
                 )
-            board_array, context_array = canonicalize_value_tensors(
-                board_array, context_array
-            )
+            elif self._input_canonicalization == CANONICALIZATION_REFILL_COUNT:
+                board_array, context_array = canonicalize_value_tensors(
+                    board_array, context_array
+                )
+                context_array = append_refill_count_context(
+                    context_array,
+                    [record.refill_count for record in records],
+                )
+            elif self._input_canonicalization == CANONICALIZATION_REFILL_COUNT_SCALAR:
+                board_array, context_array = canonicalize_value_tensors(
+                    board_array, context_array
+                )
+                context_array = append_refill_count_scalar_context(
+                    context_array,
+                    [record.refill_count for record in records],
+                )
+            else:
+                from yellowstone.value_board_columns import (
+                    CANONICALIZATION_BOARD_COLUMNS_V1,
+                    board_columns_from_canonical_v1_tensors,
+                )
+                from yellowstone.value_board_centered import (
+                    BOARD_CENTERED_V1_CANONICALIZATIONS,
+                    board_center_records_with_stats,
+                )
+
+                if self._input_canonicalization == CANONICALIZATION_BOARD_COLUMNS_V1:
+                    board_array, context_array = canonicalize_value_tensors(
+                        board_array, context_array
+                    )
+                    board_array, context_array, _ = (
+                        board_columns_from_canonical_v1_tensors(
+                            board_array, context_array
+                        )
+                    )
+                elif self._input_canonicalization in BOARD_CENTERED_V1_CANONICALIZATIONS:
+                    board_array, context_array, _ = board_center_records_with_stats(
+                        records,
+                        canonicalization=str(self._input_canonicalization),
+                    )
+                else:
+                    raise ValueError(
+                        "unsupported value-input canonicalization: "
+                        f"{self._input_canonicalization}"
+                    )
         with self._torch.no_grad():
             board = self._torch.from_numpy(board_array)
             context = self._torch.from_numpy(context_array)

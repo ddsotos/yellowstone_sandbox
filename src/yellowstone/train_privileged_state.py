@@ -7,6 +7,7 @@ from pathlib import Path
 
 from yellowstone.privileged_state import (
     CANONICALIZATION_PRIVILEGED_STATE,
+    FEATURE_CONTRACT_PRIVILEGED_STATE,
     HISTORY_SEMANTICS_PRIVILEGED_STATE,
     PRIVILEGED_STATE_CONTEXT_SIZE,
     VALUE_SCHEMA_PRIVILEGED_STATE,
@@ -93,6 +94,7 @@ def train_privileged_state(
             "value_schema": VALUE_SCHEMA_PRIVILEGED_STATE,
             "input_canonicalization": CANONICALIZATION_PRIVILEGED_STATE,
             "history_semantics": HISTORY_SEMANTICS_PRIVILEGED_STATE,
+            "feature_contract": FEATURE_CONTRACT_PRIVILEGED_STATE,
             "context_size": PRIVILEGED_STATE_CONTEXT_SIZE,
             "privileged_inputs": True,
             "deployable_policy_model": False,

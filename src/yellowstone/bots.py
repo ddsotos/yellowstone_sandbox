@@ -7,11 +7,14 @@ from random import Random
 from typing import Protocol
 
 from yellowstone.game import (
+    all_frames,
     apply_known_legal_action,
     frame_positions,
+    frames_containing,
     legal_actions,
     occupied_count_in_frame,
 )
+from yellowstone.safe_count_features import rank_color_offset_count_for_player
 from yellowstone.types import (
     Action,
     Board,
@@ -100,13 +103,89 @@ class ExploratoryHeuristicBot:
         return first_action
 
 
+ONE_OFF_BUCKET_PROBABILITIES = {
+    "0": 0.10,
+    "1": 0.40,
+    "2_plus": 0.60,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class HandSixBranch:
+    bucket: str
+    probability: float
+    draw: float
+    taken: bool
+
+
+@dataclass(slots=True)
+class FixedFrameHandSixOneOffMinLossOneCardBot:
+    """Hand-six heuristic variant with one-off-count one-card branches."""
+
+    rng: Random = field(default_factory=Random)
+    _forced_one_card_players: set[int] = field(default_factory=set, init=False)
+    last_branch: HandSixBranch | None = field(default=None, init=False)
+
+    def choose_action(self, state: GameState) -> Action | None:
+        """Force a min-loss one-card turn in board-five hand-six states."""
+        if state.phase != Phase.PLAY:
+            self.last_branch = None
+            return choose_heuristic_action(state)
+
+        player_index = state.current_player_index
+        if state.cards_played_this_turn == 1:
+            self.last_branch = None
+            if player_index in self._forced_one_card_players:
+                self._forced_one_card_players.remove(player_index)
+                end_turn = _first_action(legal_actions(state), EndTurnAction)
+                if end_turn is not None:
+                    return end_turn
+            return choose_heuristic_action(state)
+
+        if state.cards_played_this_turn != 0:
+            self.last_branch = None
+            return choose_heuristic_action(state)
+
+        player = state.players[player_index]
+        if len(player.hand) != 6 or _board_card_count(state) < 5:
+            self.last_branch = None
+            return choose_heuristic_action(state)
+
+        one_off_count = rank_color_offset_count_for_player(state, player_index)[1]
+        bucket = _one_off_bucket(one_off_count)
+        probability = ONE_OFF_BUCKET_PROBABILITIES[bucket]
+        draw = self.rng.random()
+        self.last_branch = HandSixBranch(
+            bucket=bucket,
+            probability=probability,
+            draw=draw,
+            taken=False,
+        )
+        if draw >= probability:
+            return choose_heuristic_action(state)
+
+        self.last_branch = HandSixBranch(
+            bucket=bucket,
+            probability=probability,
+            draw=draw,
+            taken=True,
+        )
+        self._forced_one_card_players.add(player_index)
+        return choose_heuristic_action(state, force_one_card_turn=True)
+
+
+HandSixMinLossOneCardBot = FixedFrameHandSixOneOffMinLossOneCardBot
+
+
 @dataclass(frozen=True, slots=True)
 class _PlacementCandidate:
     action: PlaceCardAction
     sort_key: tuple[int, ...]
 
 
-def choose_heuristic_action(state: GameState) -> Action | None:
+def choose_heuristic_action(
+    state: GameState, *, force_one_card_turn: bool = False
+) -> Action | None:
     """Choose one deterministic heuristic action."""
     actions = legal_actions(state)
     if not actions:
@@ -130,10 +209,17 @@ def choose_heuristic_action(state: GameState) -> Action | None:
         end_turn = _first_action(actions, EndTurnAction)
         return end_turn
 
+    if force_one_card_turn and state.cards_played_this_turn == 1:
+        end_turn = _first_action(actions, EndTurnAction)
+        if end_turn is not None:
+            return end_turn
+
     if state.cards_played_this_turn == 0:
         no_damage_first = _choose_no_damage_first_action(state, place_actions)
         if no_damage_first is not None:
             return no_damage_first
+        if force_one_card_turn:
+            return min(place_actions, key=lambda action: placement_sort_key(state, action))
         return min(place_actions, key=lambda action: placement_sort_key(state, action))
 
     no_damage_second = _no_damage_candidates(
@@ -273,6 +359,31 @@ def _loss_score_delta(state: GameState, action: PlaceCardAction) -> int:
 
 def _player_negative_count(state: GameState) -> int:
     return len(state.players[state.current_player_index].negative_cards)
+
+
+def _has_unique_containing_frame(state: GameState) -> bool:
+    occupied = frozenset(state.board)
+    if not occupied:
+        return False
+    count = 0
+    for frame in all_frames():
+        if occupied <= frame_positions(frame):
+            count += 1
+            if count > 1:
+                return False
+    return count == 1
+
+
+def _board_card_count(state: GameState) -> int:
+    return sum(len(stack) for stack in state.board.values())
+
+
+def _one_off_bucket(one_off_count: int) -> str:
+    if one_off_count <= 0:
+        return "0"
+    if one_off_count == 1:
+        return "1"
+    return "2_plus"
 
 
 def _same_color_remaining_count(

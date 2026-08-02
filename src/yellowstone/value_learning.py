@@ -48,6 +48,9 @@ class ValueRecord:
     state: GameState
     history: tuple[RecentPlacement, ...]
     target: float
+    board_center_frame_history: tuple[tuple[int, int], ...] = ()
+    board_center_chain_states: tuple[GameState, ...] = ()
+    refill_count: int = 0
 
 
 def collect_heuristic_games(

@@ -1,14 +1,26 @@
 from dataclasses import replace
 from random import Random
+from types import SimpleNamespace
 
 from yellowstone.exploratory_collection import (
     EMPTY_HAND_DECK_REFILL_PROBABILITY,
-    LOW_HAND_NO_REFILL_PROBABILITY,
     ExploratoryValueNpc,
+    _choose_min_loss_one_or_two_actions,
+    _one_off_card_counts,
+    _safe_one_card_counts,
     choose_exploratory_refill,
 )
 from yellowstone.game import create_initial_state
-from yellowstone.types import Phase, RefillSource
+from yellowstone.safe_count_features import rank_color_offset_count_for_player
+from yellowstone.types import (
+    Card,
+    Color,
+    GameState,
+    Phase,
+    PlayerState,
+    Position,
+    RefillSource,
+)
 
 
 class _IncreasingEstimator:
@@ -25,6 +37,136 @@ class _FixedRandom:
 
     def choice(self, values):
         return values[0]
+
+
+def _fake_group(loss: int, label: str):
+    return SimpleNamespace(
+        negative_card_increase=loss,
+        outcomes=((label,),),
+    )
+
+
+def _fake_pools(one_losses, two_losses):
+    return SimpleNamespace(
+        one_card_groups=tuple(
+            _fake_group(loss, f"one-{index}")
+            for index, loss in enumerate(one_losses)
+        ),
+        two_card_groups=tuple(
+            _fake_group(loss, f"two-{index}")
+            for index, loss in enumerate(two_losses)
+        ),
+    )
+
+
+def _count_state(
+    board_cards: tuple[Card, ...],
+    hand: tuple[Card, ...],
+) -> GameState:
+    return GameState(
+        players=(
+            PlayerState(hand=hand),
+            PlayerState(),
+            PlayerState(),
+            PlayerState(),
+        ),
+        board={
+            Position(index, card.rank_index): (card,)
+            for index, card in enumerate(board_cards)
+        },
+    )
+
+
+def test_safe_counts_use_rank_window_union() -> None:
+    state = _count_state(
+        (
+            Card(Color.RED, 2),
+            Card(Color.BLUE, 4),
+        ),
+        tuple(Card(Color.RED, rank) for rank in range(7)),
+    )
+
+    assert _safe_one_card_counts(state)[0] == 3
+    assert _one_off_card_counts(state)[0] == 2
+
+
+def test_safe_counts_treat_consecutive_two_neighbors_as_safe() -> None:
+    state = _count_state(
+        (
+            Card(Color.RED, 2),
+            Card(Color.BLUE, 3),
+        ),
+        tuple(Card(Color.RED, rank) for rank in range(7)),
+    )
+
+    assert _safe_one_card_counts(state)[0] == 4
+    assert _one_off_card_counts(state)[0] == 2
+
+
+def test_safe_counts_treat_single_rank_neighbors_and_next_neighbors_as_safe() -> None:
+    state = _count_state(
+        (Card(Color.RED, 3),),
+        tuple(Card(Color.RED, rank) for rank in range(7)),
+    )
+
+    assert _safe_one_card_counts(state)[0] == 5
+    assert _one_off_card_counts(state)[0] == 2
+
+
+def test_safe_counts_add_color_and_rank_offsets() -> None:
+    state = _count_state(
+        (
+            Card(Color.RED, 2),
+            Card(Color.BLUE, 3),
+            Card(Color.GREEN, 4),
+        ),
+        (
+            Card(Color.RED, 3),
+            Card(Color.YELLOW, 3),
+            Card(Color.RED, 1),
+            Card(Color.YELLOW, 1),
+        ),
+    )
+
+    assert _safe_one_card_counts(state)[0] == 1
+    assert _one_off_card_counts(state)[0] == 2
+
+
+def test_safe_counts_do_not_penalize_missing_color_with_two_board_colors() -> None:
+    state = _count_state(
+        (
+            Card(Color.RED, 2),
+            Card(Color.BLUE, 3),
+        ),
+        (
+            Card(Color.YELLOW, 3),
+            Card(Color.YELLOW, 0),
+        ),
+    )
+
+    assert _safe_one_card_counts(state)[0] == 1
+    assert _one_off_card_counts(state)[0] == 1
+
+
+def test_single_player_offset_count_matches_all_player_count() -> None:
+    state = _count_state(
+        (
+            Card(Color.RED, 2),
+            Card(Color.BLUE, 3),
+            Card(Color.GREEN, 4),
+        ),
+        (
+            Card(Color.RED, 3),
+            Card(Color.YELLOW, 3),
+            Card(Color.RED, 1),
+            Card(Color.YELLOW, 1),
+        ),
+    )
+
+    assert rank_color_offset_count_for_player(state, 0) == (
+        _safe_one_card_counts(state)[0],
+        _one_off_card_counts(state)[0],
+    )
 
 
 def test_hand_six_selects_safe_one_below_thirty_percent() -> None:
@@ -136,7 +278,65 @@ def test_lazy_single_pass_matches_existing_baseline() -> None:
     assert lazy_choice.baseline_scores == old_choice.baseline_scores
 
 
-def test_low_starting_hand_uses_ten_percent_no_refill() -> None:
+def test_min_loss_gap_of_three_forces_one_card() -> None:
+    pools = _fake_pools([1], [4])
+
+    group, actions, mode, probability, _ = (
+        _choose_min_loss_one_or_two_actions(
+            pools, starting_hand_size=4, rng=_FixedRandom(0.99)
+        )
+    )
+
+    assert group.negative_card_increase == 1
+    assert actions == ("one-0",)
+    assert mode == "random_min_loss_one"
+    assert probability == 1.0
+
+
+def test_hand_six_splits_min_loss_one_and_two_evenly() -> None:
+    pools = _fake_pools([2], [3])
+
+    one = _choose_min_loss_one_or_two_actions(
+        pools, starting_hand_size=6, rng=_FixedRandom(0.49)
+    )
+    two = _choose_min_loss_one_or_two_actions(
+        pools, starting_hand_size=6, rng=_FixedRandom(0.50)
+    )
+
+    assert one[2] == "random_min_loss_one"
+    assert one[3] == 0.50
+    assert two[2] == "random_min_loss_two"
+    assert two[0].negative_card_increase == 3
+
+
+def test_hand_five_uses_twenty_eighty_min_loss_split() -> None:
+    pools = _fake_pools([2], [3])
+
+    one = _choose_min_loss_one_or_two_actions(
+        pools, starting_hand_size=5, rng=_FixedRandom(0.19)
+    )
+    two = _choose_min_loss_one_or_two_actions(
+        pools, starting_hand_size=5, rng=_FixedRandom(0.20)
+    )
+
+    assert one[2] == "random_min_loss_one"
+    assert one[3] == 0.20
+    assert two[2] == "random_min_loss_two"
+
+
+def test_hand_four_or_less_forces_min_loss_two_when_gap_is_small() -> None:
+    pools = _fake_pools([2], [3])
+
+    group, _, mode, probability, _ = _choose_min_loss_one_or_two_actions(
+        pools, starting_hand_size=4, rng=_FixedRandom(0.0)
+    )
+
+    assert mode == "random_min_loss_two"
+    assert probability == 0.0
+    assert group.negative_card_increase == 3
+
+
+def test_non_empty_refill_always_uses_deck() -> None:
     state = create_initial_state(4, seed=17)
     player = state.players[0]
     players = (replace(player, hand=player.hand[:2]), *state.players[1:])
@@ -151,11 +351,10 @@ def test_low_starting_hand_uses_ten_percent_no_refill() -> None:
         refill, rng=_FixedRandom(0.0)
     )
 
-    assert action.source == RefillSource.NONE
+    assert action.source == RefillSource.DECK
     assert audit["starting_hand_size"] == 4
-    assert audit["no_refill_probability"] == (
-        LOW_HAND_NO_REFILL_PROBABILITY
-    )
+    assert audit["no_refill_probability"] == 0.0
+    assert audit["selected_source"] == RefillSource.DECK.value
 
 
 def test_empty_hand_uses_ten_percent_deck_and_ninety_negative() -> None:

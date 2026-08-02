@@ -21,11 +21,20 @@ def win_value_architecture_id(
     convolution_layers: int,
     hidden_channels: int,
     hidden_size: int,
+    board_channels: int = RANK_BOARD_CHANNELS,
+    board_size: int = 7,
+    board_height: int | None = None,
+    board_width: int | None = None,
 ) -> str:
-    return (
+    height = board_size if board_height is None else board_height
+    width = board_size if board_width is None else board_width
+    architecture = (
         "yellowstone.win_value.v1."
         f"conv{convolution_layers}_{hidden_channels}_fc{hidden_size}"
     )
+    if board_channels != RANK_BOARD_CHANNELS or height != 7 or width != 7:
+        architecture += f"_board{board_channels}x{height}x{width}"
+    return architecture
 
 
 def win_value_architecture_metadata(
@@ -33,22 +42,44 @@ def win_value_architecture_metadata(
     convolution_layers: int = DEFAULT_WIN_VALUE_CONVOLUTION_LAYERS,
     hidden_channels: int = DEFAULT_WIN_VALUE_HIDDEN_CHANNELS,
     hidden_size: int = DEFAULT_WIN_VALUE_HIDDEN_SIZE,
+    board_channels: int = RANK_BOARD_CHANNELS,
+    board_size: int = 7,
+    board_height: int | None = None,
+    board_width: int | None = None,
 ) -> dict[str, int | str]:
+    height = board_size if board_height is None else board_height
+    width = board_size if board_width is None else board_width
     _validate_win_value_architecture(
         convolution_layers=convolution_layers,
         hidden_channels=hidden_channels,
         hidden_size=hidden_size,
+        board_channels=board_channels,
+        board_height=height,
+        board_width=width,
     )
-    return {
+    metadata: dict[str, int | str] = {
         "model_architecture": win_value_architecture_id(
             convolution_layers=convolution_layers,
             hidden_channels=hidden_channels,
             hidden_size=hidden_size,
+            board_channels=board_channels,
+            board_size=board_size,
+            board_height=height,
+            board_width=width,
         ),
         "convolution_layers": convolution_layers,
         "hidden_channels": hidden_channels,
         "hidden_size": hidden_size,
     }
+    if board_channels != RANK_BOARD_CHANNELS or height != 7 or width != 7:
+        metadata["board_channels"] = board_channels
+        if height == width:
+            metadata["board_size"] = height
+        else:
+            metadata["board_height"] = height
+            metadata["board_width"] = width
+            metadata["board_shape"] = [board_channels, height, width]
+    return metadata
 
 
 def win_value_architecture_from_checkpoint(
@@ -68,10 +99,18 @@ def win_value_architecture_from_checkpoint(
     hidden_size = int(
         checkpoint.get("hidden_size", DEFAULT_WIN_VALUE_HIDDEN_SIZE)
     )
+    board_channels = int(checkpoint.get("board_channels", RANK_BOARD_CHANNELS))
+    board_size = int(checkpoint.get("board_size", 7))
+    board_height = int(checkpoint.get("board_height", board_size))
+    board_width = int(checkpoint.get("board_width", board_size))
     metadata = win_value_architecture_metadata(
         convolution_layers=convolution_layers,
         hidden_channels=hidden_channels,
         hidden_size=hidden_size,
+        board_channels=board_channels,
+        board_size=board_size,
+        board_height=board_height,
+        board_width=board_width,
     )
     if has_architecture and checkpoint["model_architecture"] != metadata[
         "model_architecture"
@@ -88,11 +127,19 @@ def _validate_win_value_architecture(
     convolution_layers: int,
     hidden_channels: int,
     hidden_size: int,
+    board_channels: int = RANK_BOARD_CHANNELS,
+    board_size: int = 7,
+    board_height: int | None = None,
+    board_width: int | None = None,
 ) -> None:
+    height = board_size if board_height is None else board_height
+    width = board_size if board_width is None else board_width
     if convolution_layers not in (2, 3):
         raise ValueError("win-value convolution layers must be 2 or 3")
     if hidden_channels <= 0 or hidden_size <= 0:
         raise ValueError("win-value hidden dimensions must be positive")
+    if board_channels <= 0 or height <= 0 or width <= 0:
+        raise ValueError("win-value board dimensions must be positive")
 
 
 def torch_available() -> bool:
@@ -143,6 +190,10 @@ def build_win_value_net(
     hidden_size: int = DEFAULT_WIN_VALUE_HIDDEN_SIZE,
     context_size: int = VALUE_CONTEXT_SIZE,
     convolution_layers: int = DEFAULT_WIN_VALUE_CONVOLUTION_LAYERS,
+    board_channels: int = RANK_BOARD_CHANNELS,
+    board_size: int = 7,
+    board_height: int | None = None,
+    board_width: int | None = None,
 ):
     """Build a player-perspective CNN that returns one win-probability logit."""
     try:
@@ -151,10 +202,15 @@ def build_win_value_net(
     except ModuleNotFoundError as error:
         raise ImportError("win-value support requires `pip install -e .[value]`") from error
 
+    height = board_size if board_height is None else board_height
+    width = board_size if board_width is None else board_width
     _validate_win_value_architecture(
         convolution_layers=convolution_layers,
         hidden_channels=hidden_channels,
         hidden_size=hidden_size,
+        board_channels=board_channels,
+        board_height=height,
+        board_width=width,
     )
 
     class YellowstoneWinValueNet(nn.Module):
@@ -162,7 +218,7 @@ def build_win_value_net(
             super().__init__()
             layers: list[nn.Module] = [
                 nn.Conv2d(
-                    RANK_BOARD_CHANNELS,
+                    board_channels,
                     hidden_channels,
                     3,
                     padding=1,
@@ -184,7 +240,10 @@ def build_win_value_net(
             layers.append(nn.Flatten())
             self.board_encoder = nn.Sequential(*layers)
             self.trunk = nn.Sequential(
-                nn.Linear(hidden_channels * 7 * 7 + context_size, hidden_size),
+                nn.Linear(
+                    hidden_channels * height * width + context_size,
+                    hidden_size,
+                ),
                 nn.ReLU(),
             )
             self.value_head = nn.Linear(hidden_size, 1)

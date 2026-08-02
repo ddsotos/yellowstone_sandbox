@@ -9,6 +9,7 @@ from pathlib import Path
 
 from yellowstone.privileged_state import (
     CANONICALIZATION_PRIVILEGED_STATE,
+    FEATURE_CONTRACT_PRIVILEGED_STATE,
     HISTORY_SEMANTICS_PRIVILEGED_STATE,
     VALUE_SCHEMA_PRIVILEGED_STATE,
     encode_privileged_state,
@@ -40,11 +41,18 @@ def convert_privileged_state(source: str | Path, output: str | Path) -> dict:
         "schema": VALUE_SCHEMA_PRIVILEGED_STATE,
         "canonicalization": CANONICALIZATION_PRIVILEGED_STATE,
         "history_semantics": HISTORY_SEMANTICS_PRIVILEGED_STATE,
-        "source": str(source_path),
+        "feature_contract": FEATURE_CONTRACT_PRIVILEGED_STATE,
         "privileged_inputs": True,
     }
     for key, value in expected.items():
-        if key in progress and progress[key] != value:
+        existing = progress.get(key)
+        if key == "source" and existing is not None:
+            # Allow a resume from the same source expressed as relative or absolute.
+            existing = str(existing).replace("/", "\\").lower()
+            value = str(value).replace("/", "\\").lower()
+            if existing.endswith(value) or value.endswith(existing):
+                existing = value
+        if key in progress and existing != value:
             raise ValueError(f"conversion progress differs at {key}")
         progress[key] = value
 

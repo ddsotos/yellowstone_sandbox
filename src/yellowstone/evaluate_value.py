@@ -45,8 +45,116 @@ def validate_checkpoint_contract(
             if current_turn_history_only
             else ORIGINAL_HISTORY_SEMANTICS
         ),
-        "input_canonicalization": CANONICALIZATION,
     }
+    canonicalization = checkpoint.get("input_canonicalization")
+    if canonicalization == CANONICALIZATION:
+        expected["input_canonicalization"] = CANONICALIZATION
+    else:
+        from yellowstone.value_refill_count import (
+            CANONICALIZATION_REFILL_COUNT,
+            CANONICALIZATION_REFILL_COUNT_SCALAR,
+            refill_count_metadata,
+            refill_count_scalar_metadata,
+        )
+
+        if canonicalization == CANONICALIZATION_REFILL_COUNT:
+            expected["input_canonicalization"] = CANONICALIZATION_REFILL_COUNT
+            expected.update(refill_count_metadata())
+            mismatches = {
+                key: {"expected": value, "actual": checkpoint.get(key)}
+                for key, value in expected.items()
+                if checkpoint.get(key) != value
+            }
+            if mismatches:
+                raise ValueError(
+                    "checkpoint/inference input contract mismatch: "
+                    + json.dumps(mismatches, sort_keys=True)
+                )
+            return {
+                **expected,
+                **win_value_architecture_from_checkpoint(checkpoint),
+                "inference_history": (
+                    "turn_local"
+                    if current_turn_history_only
+                    else "rolling"
+                ),
+            }
+        if canonicalization == CANONICALIZATION_REFILL_COUNT_SCALAR:
+            expected["input_canonicalization"] = CANONICALIZATION_REFILL_COUNT_SCALAR
+            expected.update(refill_count_scalar_metadata())
+            mismatches = {
+                key: {"expected": value, "actual": checkpoint.get(key)}
+                for key, value in expected.items()
+                if checkpoint.get(key) != value
+            }
+            if mismatches:
+                raise ValueError(
+                    "checkpoint/inference input contract mismatch: "
+                    + json.dumps(mismatches, sort_keys=True)
+                )
+            return {
+                **expected,
+                **win_value_architecture_from_checkpoint(checkpoint),
+                "inference_history": (
+                    "turn_local"
+                    if current_turn_history_only
+                    else "rolling"
+                ),
+            }
+        from yellowstone.value_board_columns import (
+            CANONICALIZATION_BOARD_COLUMNS_V1,
+            board_columns_metadata,
+        )
+
+        if canonicalization == CANONICALIZATION_BOARD_COLUMNS_V1:
+            expected["input_canonicalization"] = CANONICALIZATION_BOARD_COLUMNS_V1
+            expected["history_semantics"] = "none"
+            expected.update(board_columns_metadata())
+            mismatches = {
+                key: {"expected": value, "actual": checkpoint.get(key)}
+                for key, value in expected.items()
+                if checkpoint.get(key) != value
+            }
+            if mismatches:
+                raise ValueError(
+                    "checkpoint/inference input contract mismatch: "
+                    + json.dumps(mismatches, sort_keys=True)
+                )
+            return {
+                **expected,
+                **win_value_architecture_from_checkpoint(checkpoint),
+                "inference_history": "none",
+            }
+        from yellowstone.value_board_centered import (
+            BOARD_CENTERED_V1,
+            BOARD_CENTERED_V1_CANONICALIZATIONS,
+            BOARD_CENTERED_V1_HISTORY_NONE,
+            BOARD_CENTERED_V1_HISTORY_OWN_FRAME_DELTA_2CYCLE,
+            BOARD_CENTERED_V1_HISTORY_TURN_LOCAL,
+            BOARD_CENTERED_V1_HISTORY_V1,
+            BOARD_CENTERED_V1_CHAIN_HISTORY,
+            board_centered_metadata,
+        )
+
+        if canonicalization not in BOARD_CENTERED_V1_CANONICALIZATIONS:
+            expected["input_canonicalization"] = CANONICALIZATION
+        else:
+            expected["input_canonicalization"] = canonicalization
+            expected["history_semantics"] = {
+                BOARD_CENTERED_V1: ORIGINAL_HISTORY_SEMANTICS,
+                BOARD_CENTERED_V1_HISTORY_V1: ORIGINAL_HISTORY_SEMANTICS,
+                BOARD_CENTERED_V1_HISTORY_NONE: "none",
+                BOARD_CENTERED_V1_HISTORY_OWN_FRAME_DELTA_2CYCLE: (
+                    "own_frame_delta_2cycle"
+                ),
+                BOARD_CENTERED_V1_HISTORY_TURN_LOCAL: (
+                    "evaluated_turn_one_or_two_placements"
+                ),
+                BOARD_CENTERED_V1_CHAIN_HISTORY: (
+                    "bcenter_chain_play_after_deltas_4_8_12"
+                ),
+            }[str(canonicalization)]
+            expected.update(board_centered_metadata(str(canonicalization)))
     mismatches = {
         key: {"expected": value, "actual": checkpoint.get(key)}
         for key, value in expected.items()

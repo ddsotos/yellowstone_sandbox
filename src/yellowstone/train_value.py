@@ -35,7 +35,7 @@ def train_from_archive(
     start_part: int | None = None,
     end_part: int | None = None,
     checkpoint_metadata: dict[str, object] | None = None,
-    context_size: int = VALUE_CONTEXT_SIZE,
+    context_size: int | None = None,
     split_game_count: int | None = None,
     train_game_id_limit: int | None = None,
     convolution_layers: int = 2,
@@ -55,6 +55,14 @@ def train_from_archive(
     paths = _archive_paths(
         data_path, start_part=start_part, end_part=end_part
     )
+    with np.load(paths[0]) as sample:
+        board_shape = sample["board"].shape[1:]
+        observed_context_size = int(sample["context"].shape[1])
+    if len(board_shape) != 3:
+        raise ValueError(f"unsupported board tensor shape: {board_shape}")
+    board_channels = int(board_shape[0])
+    board_height = int(board_shape[1])
+    board_width = int(board_shape[2])
     observed_game_count = (
         max(int(np.load(path)["game_id"].max()) for path in paths) + 1
     )
@@ -78,12 +86,22 @@ def train_from_archive(
             for game_id in train_ids
             if game_id < train_game_id_limit
         }
+    if context_size is None:
+        context_size = observed_context_size
     if context_size <= 0:
         raise ValueError("context_size must be positive")
+    if context_size != observed_context_size:
+        raise ValueError(
+            "context size must match the archive: "
+            f"{context_size} != {observed_context_size}"
+        )
     architecture = win_value_architecture_metadata(
         convolution_layers=convolution_layers,
         hidden_channels=hidden_channels,
         hidden_size=hidden_size,
+        board_channels=board_channels,
+        board_height=board_height,
+        board_width=board_width,
     )
     torch.manual_seed(seed)
     model = build_win_value_net(
@@ -91,6 +109,9 @@ def train_from_archive(
         convolution_layers=convolution_layers,
         hidden_channels=hidden_channels,
         hidden_size=hidden_size,
+        board_channels=board_channels,
+        board_height=board_height,
+        board_width=board_width,
     )
     started_fresh = resume_checkpoint is None
     if resume_checkpoint is not None:
@@ -324,7 +345,7 @@ def main() -> None:
     parser.add_argument("--value-schema")
     parser.add_argument("--history-semantics")
     parser.add_argument("--training-games", type=int)
-    parser.add_argument("--context-size", type=int, default=VALUE_CONTEXT_SIZE)
+    parser.add_argument("--context-size", type=int)
     parser.add_argument("--split-game-count", type=int)
     parser.add_argument("--train-game-id-limit", type=int)
     parser.add_argument(
@@ -344,6 +365,42 @@ def main() -> None:
         }.items()
         if value is not None
     }
+    if (
+        args.input_canonicalization is not None
+        and args.input_canonicalization.startswith("board_centered_v1")
+    ):
+        from yellowstone.value_board_centered import board_centered_metadata
+
+        metadata.update(board_centered_metadata(args.input_canonicalization))
+    elif args.input_canonicalization is not None:
+        from yellowstone.value_refill_count import (
+            CANONICALIZATION_REFILL_COUNT,
+            CANONICALIZATION_REFILL_COUNT_SCALAR,
+            refill_count_metadata,
+            refill_count_scalar_metadata,
+        )
+
+        if args.input_canonicalization == CANONICALIZATION_REFILL_COUNT:
+            metadata.update(refill_count_metadata())
+        elif args.input_canonicalization == CANONICALIZATION_REFILL_COUNT_SCALAR:
+            metadata.update(refill_count_scalar_metadata())
+        else:
+            from yellowstone.value_board_columns import (
+                CANONICALIZATION_BOARD_COLUMNS_V1,
+                board_columns_metadata,
+            )
+            from yellowstone.value_board_columns_v2 import (
+                CANONICALIZATION_BOARD_COLUMNS_V2,
+                CANONICALIZATION_PREPLAY_BOARD_COLUMNS,
+                board_columns_v2_metadata,
+            )
+
+            if args.input_canonicalization == CANONICALIZATION_BOARD_COLUMNS_V1:
+                metadata.update(board_columns_metadata())
+            elif args.input_canonicalization == CANONICALIZATION_BOARD_COLUMNS_V2:
+                metadata.update(board_columns_v2_metadata(preplay=False))
+            elif args.input_canonicalization == CANONICALIZATION_PREPLAY_BOARD_COLUMNS:
+                metadata.update(board_columns_v2_metadata(preplay=True))
     metrics = train_from_archive(
         args.data, args.checkpoint, epochs=args.epochs, batch_size=args.batch_size,
         learning_rate=args.learning_rate, seed=args.seed, resume_checkpoint=args.resume,

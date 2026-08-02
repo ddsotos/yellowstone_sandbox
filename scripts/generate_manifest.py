@@ -10,6 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "MANIFEST.sha256"
 EXCLUDED_PARTS = {
+    ".git",
     ".venv",
     ".pytest_cache",
     ".test-tmp-fast-enum",
@@ -18,6 +19,7 @@ EXCLUDED_PARTS = {
     "logs",
     "models",
     "results",
+    "tmp",
 }
 
 

@@ -1,6 +1,12 @@
 import pytest
 
-from yellowstone.game import apply_known_legal_action, create_initial_state, legal_actions
+from yellowstone.game import (
+    apply_known_legal_action,
+    can_place_card_at,
+    columns_containing_color,
+    create_initial_state,
+    legal_actions,
+)
 from yellowstone.types import Card, Color, GameState, Phase, PlaceCardAction, PlayerState, Position
 from yellowstone.value_policy import (
     enumerate_best_turn_card_group,
@@ -8,6 +14,7 @@ from yellowstone.value_policy import (
     enumerate_grouped_turn_pools,
     TorchWinValueEstimator,
     _candidate_actions,
+    _candidate_positions_by_card,
     _representative_frame_actions,
     _turn_public_result_key,
     enumerate_turn_end_candidates,
@@ -123,6 +130,55 @@ def test_candidate_actions_are_subset_of_legal_actions_after_first_play() -> Non
 
     assert exact <= legal
     assert len(exact) < len(legal)
+
+
+def test_batched_candidate_positions_match_per_card_helper() -> None:
+    for seed in range(7, 27):
+        state = create_initial_state(4, seed=seed)
+        first = next(
+            action
+            for action in legal_actions(state)
+            if isinstance(action, PlaceCardAction)
+        )
+        states = (state, apply_known_legal_action(state, first))
+        for candidate in states:
+            hand = candidate.players[candidate.current_player_index].hand
+            for approximate in (False, True):
+                batched = _candidate_positions_by_card(
+                    candidate.board,
+                    hand,
+                    approximate_new_color_neighbor_limit=approximate,
+                )
+                expected = tuple(
+                    _legacy_candidate_positions(candidate.board, card, approximate)
+                    for card in hand
+                )
+                assert batched == expected
+
+
+def _legacy_candidate_positions(board, card, approximate):
+    color_columns = columns_containing_color(board, card.color)
+    if color_columns or not approximate:
+        candidate_columns = range(7)
+    else:
+        occupied = sorted({position.x for position in board})
+        if not occupied:
+            candidate_columns = range(7)
+        else:
+            radius = 2 if len(occupied) == 1 else 1
+            candidate_columns = tuple(
+                column
+                for column in range(7)
+                if any(abs(column - item) <= radius for item in occupied)
+            )
+    return tuple(
+        position
+        for position in (
+            Position(x=column, y=card.rank_index)
+            for column in candidate_columns
+        )
+        if can_place_card_at(board, card, position)
+    )
 
 
 def test_representative_frame_actions_keeps_single_zero_loss_frame() -> None:

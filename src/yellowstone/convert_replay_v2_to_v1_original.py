@@ -14,7 +14,13 @@ from yellowstone.replay_v2 import (
     ReplayGameV2,
     read_replay_shard,
 )
-from yellowstone.types import EndTurnAction, Phase, PlaceCardAction
+from yellowstone.types import (
+    EndTurnAction,
+    GameState,
+    Phase,
+    PlaceCardAction,
+    RefillAction,
+)
 from yellowstone.value_canonicalization import (
     CANONICALIZATION_NAME,
     canonicalize_value_tensors_with_stats,
@@ -25,6 +31,15 @@ from yellowstone.value_learning import (
     ValueRecord,
     board_tensor_for_player,
     context_tensor_for_player,
+)
+from yellowstone.value_refill_count import (
+    CANONICALIZATION_REFILL_COUNT,
+    CANONICALIZATION_REFILL_COUNT_SCALAR,
+    canonicalize_refill_count_tensors,
+    canonicalize_refill_count_scalar_tensors,
+    refill_count_for_action,
+    refill_count_metadata,
+    refill_count_scalar_metadata,
 )
 
 
@@ -109,6 +124,137 @@ def records_from_replay_v1_original(
     )
 
 
+def records_from_replay_v1_refill_count(
+    game: ReplayGameV2,
+) -> tuple[ValueRecord, ...]:
+    """Rebuild Original V1 records with explicit pending refill-card counts."""
+    state = game.initial_state
+    rng = Random(game.gameplay_seed)
+    history: list[RecentPlacement] = []
+    pending: list[tuple[int, int, GameState, tuple[RecentPlacement, ...]]] = []
+    completed: list[tuple[int, ValueRecord]] = []
+    next_record_index = 0
+
+    for action in game.actions:
+        before = state
+        player_index = before.current_player_index
+        card = (
+            before.players[player_index].hand[action.hand_index]
+            if isinstance(action, PlaceCardAction)
+            else None
+        )
+        if isinstance(action, RefillAction):
+            if not pending:
+                raise AssertionError("refill action lacks a pending V1 record")
+            (
+                record_index,
+                pending_player,
+                snapshot,
+                snapshot_history,
+            ) = pending.pop()
+            if pending_player != player_index:
+                raise AssertionError("pending refill player differs")
+            refill_snapshot = ValueRecord(
+                game_id=game.game_id,
+                perspective_player_index=pending_player,
+                state=snapshot,
+                history=snapshot_history,
+                target=0.0,
+            )
+            completed.append(
+                (
+                    record_index,
+                    ValueRecord(
+                        game_id=game.game_id,
+                        perspective_player_index=pending_player,
+                        state=snapshot,
+                        history=snapshot_history,
+                        target=0.0,
+                        refill_count=refill_count_for_action(
+                            refill_snapshot,
+                            action,
+                        ),
+                    ),
+                )
+            )
+        state = apply_known_legal_action(
+            state,
+            action,
+            rng=rng,
+            settle_on_empty_deck=(
+                game.rules_version != LEGACY_RULES_VERSION_V2
+            ),
+        )
+
+        if isinstance(action, PlaceCardAction):
+            if card is None:
+                raise AssertionError("placement card was not captured")
+            history.append(
+                RecentPlacement(
+                    player_index=player_index,
+                    card=card,
+                    score_delta=(
+                        before.players[player_index].loss_score
+                        - state.players[player_index].loss_score
+                    ),
+                    negative_card_delta=(
+                        len(state.players[player_index].negative_cards)
+                        - len(before.players[player_index].negative_cards)
+                    ),
+                )
+            )
+            del history[:-HISTORY_SIZE]
+            if state.phase == Phase.REFILL:
+                pending.append(
+                    (next_record_index, player_index, state, tuple(history))
+                )
+                next_record_index += 1
+        elif isinstance(action, EndTurnAction):
+            if before.cards_played_this_turn != 1 or not history:
+                raise AssertionError("one-card completion lacks a placement")
+            pending.append(
+                (next_record_index, player_index, state, tuple(history))
+            )
+            next_record_index += 1
+
+    if state.phase != Phase.GAME_OVER:
+        raise ValueError(f"replay game {game.game_id} did not finish")
+    if state.winners != game.winners:
+        raise ValueError(f"replay winners differ for game {game.game_id}")
+    if not state.winners:
+        raise AssertionError("finished replay has no winners")
+    winner_count = len(state.winners)
+    completed.extend(
+        (
+            record_index,
+            ValueRecord(
+                game_id=game.game_id,
+                perspective_player_index=player_index,
+                state=snapshot,
+                history=snapshot_history,
+                target=0.0,
+                refill_count=0,
+            ),
+        )
+        for record_index, player_index, snapshot, snapshot_history in pending
+    )
+    return tuple(
+        ValueRecord(
+            game_id=record.game_id,
+            perspective_player_index=record.perspective_player_index,
+            state=record.state,
+            history=record.history,
+            target=(
+                1.0 / winner_count
+                if record.perspective_player_index in state.winners
+                else 0.0
+            ),
+            refill_count=record.refill_count,
+        )
+        for _, record in sorted(completed, key=lambda item: item[0])
+    )
+
+
 def convert_replay_shards(
     source: str | Path,
     output: str | Path,
@@ -118,6 +264,7 @@ def convert_replay_shards(
     game_id_rebase: int = 0,
     expected_source_game_id_min: int | None = None,
     expected_source_game_id_max: int | None = None,
+    input_canonicalization: str = CANONICALIZATION_NAME,
 ) -> dict[str, object]:
     """Convert restartable replay shards and optionally audit a reference set."""
     import numpy as np
@@ -141,22 +288,54 @@ def convert_replay_shards(
         if destination.is_file():
             skipped_files += 1
             continue
-        rows = [
-            record
-            for game in read_replay_shard(path)
-            for record in records_from_replay_v1_original(game)
-        ]
+        record_builder = (
+            records_from_replay_v1_refill_count
+            if input_canonicalization
+            in (CANONICALIZATION_REFILL_COUNT, CANONICALIZATION_REFILL_COUNT_SCALAR)
+            else records_from_replay_v1_original
+        )
+        rows = []
+        for game in read_replay_shard(path):
+            if (
+                expected_source_game_id_min is not None
+                and game.game_id < expected_source_game_id_min
+            ):
+                continue
+            if (
+                expected_source_game_id_max is not None
+                and game.game_id > expected_source_game_id_max
+            ):
+                continue
+            rows.extend(record_builder(game))
         if not rows:
-            raise ValueError(f"replay shard produced no records: {path}")
+            skipped_files += 1
+            continue
         board = np.stack(
             [board_tensor_for_player(record) for record in rows]
         )
         context = np.stack(
             [context_tensor_for_player(record) for record in rows]
         )
-        board, context, stats = canonicalize_value_tensors_with_stats(
-            board, context
-        )
+        if input_canonicalization == CANONICALIZATION_REFILL_COUNT:
+            board, context, stats = canonicalize_refill_count_tensors(
+                board,
+                context,
+                [record.refill_count for record in rows],
+            )
+        elif input_canonicalization == CANONICALIZATION_REFILL_COUNT_SCALAR:
+            board, context, stats = canonicalize_refill_count_scalar_tensors(
+                board,
+                context,
+                [record.refill_count for record in rows],
+            )
+        elif input_canonicalization == CANONICALIZATION_NAME:
+            board, context, stats = canonicalize_value_tensors_with_stats(
+                board, context
+            )
+        else:
+            raise ValueError(
+                f"unsupported V1 original canonicalization: {input_canonicalization}"
+            )
         temporary = destination.with_suffix(".tmp.npz")
         np.savez_compressed(
             temporary,
@@ -252,7 +431,7 @@ def convert_replay_shards(
         )
     result: dict[str, object] = {
         "value_schema": VALUE_SCHEMA_V1_ORIGINAL,
-        "canonicalization": CANONICALIZATION_NAME,
+        "canonicalization": input_canonicalization,
         "source": str(source_path),
         "output": str(output_path),
         "source_shards": len(paths),
@@ -279,6 +458,10 @@ def convert_replay_shards(
             "terminal_winners_match_replay": True,
         },
     }
+    if input_canonicalization == CANONICALIZATION_REFILL_COUNT:
+        result.update(refill_count_metadata())
+    elif input_canonicalization == CANONICALIZATION_REFILL_COUNT_SCALAR:
+        result.update(refill_count_scalar_metadata())
     if reference_audit is not None:
         result["reference_audit"] = reference_audit
     temporary_manifest = output_path / "conversion_manifest.json.tmp"
@@ -354,6 +537,15 @@ def main() -> None:
     parser.add_argument("--game-id-rebase", type=int, default=0)
     parser.add_argument("--expected-source-game-id-min", type=int)
     parser.add_argument("--expected-source-game-id-max", type=int)
+    parser.add_argument(
+        "--input-canonicalization",
+        choices=(
+            CANONICALIZATION_NAME,
+            CANONICALIZATION_REFILL_COUNT,
+            CANONICALIZATION_REFILL_COUNT_SCALAR,
+        ),
+        default=CANONICALIZATION_NAME,
+    )
     args = parser.parse_args()
     convert_replay_shards(
         args.source,
@@ -363,6 +555,7 @@ def main() -> None:
         game_id_rebase=args.game_id_rebase,
         expected_source_game_id_min=args.expected_source_game_id_min,
         expected_source_game_id_max=args.expected_source_game_id_max,
+        input_canonicalization=args.input_canonicalization,
     )
 
 

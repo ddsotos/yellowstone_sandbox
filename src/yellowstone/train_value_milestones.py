@@ -11,6 +11,7 @@ from yellowstone.cnn import (
     DEFAULT_WIN_VALUE_HIDDEN_CHANNELS,
     DEFAULT_WIN_VALUE_HIDDEN_SIZE,
     build_win_value_net,
+    win_value_architecture_from_checkpoint,
     win_value_architecture_metadata,
 )
 from yellowstone.train_value import (
@@ -37,6 +38,9 @@ def train_value_milestones(
     value_schema: str = "yellowstone.value.v1",
     history_semantics: str = "rolling_last_two_placements",
     input_canonicalization: str = "fast_lr_ud_color_v1",
+    context_size: int | None = None,
+    initial_checkpoint: str | Path | None = None,
+    checkpoint_metadata: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Train one fixed V1 snapshot and save models along the same epoch."""
     import numpy as np
@@ -52,6 +56,18 @@ def train_value_milestones(
     paths = _archive_paths(
         data_path, start_part=start_part, end_part=end_part
     )
+    with np.load(paths[0]) as sample:
+        board_shape = tuple(int(value) for value in sample["board"].shape[1:])
+        observed_context_size = int(sample["context"].shape[1])
+    if len(board_shape) != 3:
+        raise ValueError(f"unsupported board tensor shape: {board_shape}")
+    if context_size is None:
+        context_size = observed_context_size
+    if context_size != observed_context_size:
+        raise ValueError(
+            "context size must match archive: "
+            f"{context_size} != {observed_context_size}"
+        )
     observed_game_count = (
         max(int(np.load(path)["game_id"].max()) for path in paths) + 1
     )
@@ -82,7 +98,13 @@ def train_value_milestones(
         convolution_layers=2,
         hidden_channels=DEFAULT_WIN_VALUE_HIDDEN_CHANNELS,
         hidden_size=DEFAULT_WIN_VALUE_HIDDEN_SIZE,
+        board_channels=board_shape[0],
+        board_height=board_shape[1],
+        board_width=board_shape[2],
     )
+    metadata = _metadata_for_canonicalization(input_canonicalization)
+    if checkpoint_metadata:
+        metadata.update(checkpoint_metadata)
     contract = {
         "training_data": str(data_path),
         "snapshot_parts": [path.name for path in paths],
@@ -97,16 +119,40 @@ def train_value_milestones(
         "value_schema": value_schema,
         "history_semantics": history_semantics,
         "input_canonicalization": input_canonicalization,
+        "context_size": context_size,
+        "initial_checkpoint": str(initial_checkpoint) if initial_checkpoint else None,
         **architecture,
+        **metadata,
     }
 
     torch.manual_seed(seed)
     model = build_win_value_net(
-        context_size=VALUE_CONTEXT_SIZE,
+        context_size=context_size,
         convolution_layers=2,
         hidden_channels=DEFAULT_WIN_VALUE_HIDDEN_CHANNELS,
         hidden_size=DEFAULT_WIN_VALUE_HIDDEN_SIZE,
+        board_channels=board_shape[0],
+        board_height=board_shape[1],
+        board_width=board_shape[2],
     )
+    if initial_checkpoint is not None:
+        checkpoint = torch.load(
+            initial_checkpoint, map_location="cpu", weights_only=False
+        )
+        if win_value_architecture_from_checkpoint(checkpoint) != architecture:
+            raise ValueError("initial checkpoint architecture differs")
+        mismatches = {
+            key: {"expected": value, "actual": checkpoint.get(key)}
+            for key, value in {
+                "value_schema": value_schema,
+                "history_semantics": history_semantics,
+                "input_canonicalization": input_canonicalization,
+            }.items()
+            if checkpoint.get(key) != value
+        }
+        if mismatches:
+            raise ValueError(f"initial checkpoint contract differs: {mismatches}")
+        model.load_state_dict(checkpoint["state_dict"])
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     processed = 0
     start_path_index = 0
@@ -256,6 +302,32 @@ def _validate_arguments(
         raise ValueError("training arguments must be positive")
 
 
+def _metadata_for_canonicalization(canonicalization: str) -> dict[str, object]:
+    from yellowstone.value_board_centered import (
+        BOARD_CENTERED_V1_CANONICALIZATIONS,
+        board_centered_metadata,
+    )
+    from yellowstone.value_board_columns import (
+        CANONICALIZATION_BOARD_COLUMNS_V1,
+        board_columns_metadata,
+    )
+    from yellowstone.value_board_columns_v2 import (
+        CANONICALIZATION_BOARD_COLUMNS_V2,
+        CANONICALIZATION_PREPLAY_BOARD_COLUMNS,
+        board_columns_v2_metadata,
+    )
+
+    if canonicalization == CANONICALIZATION_BOARD_COLUMNS_V1:
+        return board_columns_metadata()
+    if canonicalization == CANONICALIZATION_BOARD_COLUMNS_V2:
+        return board_columns_v2_metadata(preplay=False)
+    if canonicalization == CANONICALIZATION_PREPLAY_BOARD_COLUMNS:
+        return board_columns_v2_metadata(preplay=True)
+    if canonicalization in BOARD_CENTERED_V1_CANONICALIZATIONS:
+        return board_centered_metadata(canonicalization)
+    return {}
+
+
 def _count_records(paths: tuple[Path, ...], ids: set[int]) -> int:
     import numpy as np
 
@@ -289,7 +361,7 @@ def _checkpoint_payload(
         "metrics": None,
         "epochs": 1,
         "fresh_initialization": True,
-        "context_size": VALUE_CONTEXT_SIZE,
+        "context_size": contract["context_size"],
         "split_policy": "shared_population_80_10_10",
         "train_split_games": len(train_ids),
         "full_train_split_games": len(train_ids),
@@ -393,6 +465,15 @@ def main() -> None:
     parser.add_argument("--progress-checkpoint", type=Path)
     parser.add_argument("--progress-interval-parts", type=int, default=25)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--value-schema", default="yellowstone.value.v1")
+    parser.add_argument(
+        "--history-semantics", default="rolling_last_two_placements"
+    )
+    parser.add_argument(
+        "--input-canonicalization", default="fast_lr_ud_color_v1"
+    )
+    parser.add_argument("--context-size", type=int)
+    parser.add_argument("--initial-checkpoint", type=Path)
     args = parser.parse_args()
     milestones = tuple(
         int(value) for value in args.milestones.split(",")
@@ -409,6 +490,11 @@ def main() -> None:
         seed=args.seed,
         progress_checkpoint=args.progress_checkpoint,
         progress_interval_parts=args.progress_interval_parts,
+        value_schema=args.value_schema,
+        history_semantics=args.history_semantics,
+        input_canonicalization=args.input_canonicalization,
+        context_size=args.context_size,
+        initial_checkpoint=args.initial_checkpoint,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     import json

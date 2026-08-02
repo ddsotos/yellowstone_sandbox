@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from random import Random
@@ -32,6 +32,7 @@ from yellowstone.replay_v2 import (
     write_replay_shard,
 )
 from yellowstone.serialization import action_to_dict
+from yellowstone.safe_count_features import rank_color_offset_counts
 from yellowstone.types import (
     Action,
     GameState,
@@ -66,8 +67,28 @@ ONE_CARD_PROBABILITY_BY_HAND = {
     1: 0.10,
 }
 RANDOM_TWO_WHEN_NO_SAFE_ONE_PROBABILITY = 0.20
+MIN_LOSS_ONE_TWO_GAP_FORCE_ONE = 3
+MIN_LOSS_ONE_PROBABILITY_BY_HAND = {
+    6: 0.50,
+    5: 0.20,
+}
 LOW_HAND_NO_REFILL_PROBABILITY = 0.10
 EMPTY_HAND_DECK_REFILL_PROBABILITY = 0.10
+
+
+def _safe_one_card_counts(state: GameState) -> list[int]:
+    """Return rank/color offset-sum zero hand-card counts for all players.
+
+    These counts are recorded while the full game state is already available,
+    so downstream tensor conversion does not need to replay and re-enumerate
+    every historical turn.
+    """
+    return rank_color_offset_counts(state)[0]
+
+
+def _one_off_card_counts(state: GameState) -> list[int]:
+    """Return rank/color offset-sum one hand-card counts for all players."""
+    return rank_color_offset_counts(state)[1]
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,68 +199,23 @@ class ExploratoryValueNpc:
             )
 
         if not safe_one and not safe_two and pools.two_card_groups:
-            draw = rng.random()
-            if draw < RANDOM_TWO_WHEN_NO_SAFE_ONE_PROBABILITY:
-                selected_group, selected = _choose_grouped_candidate(
-                    pools.two_card_groups, rng=rng
+            selected_group, selected, mode, probability, draw = (
+                _choose_min_loss_one_or_two_grouped(
+                    state,
+                    pools,
+                    starting_hand_size=starting_hand_size,
+                    rng=rng,
                 )
-                return _choice(
-                    selected,
-                    selected_group,
-                    mode="random_min_loss_two",
-                    probability=(
-                        RANDOM_TWO_WHEN_NO_SAFE_ONE_PROBABILITY
-                    ),
-                    draw=draw,
-                    pools=pools,
-                    safe_one=safe_one,
-                    safe_two=safe_two,
-                    enumeration_seconds=enumeration_seconds,
-                )
-            min_one = min(
-                group.negative_card_increase for group in pools.one_card_groups
-            ) if pools.one_card_groups else None
-            min_two = min(
-                group.negative_card_increase for group in pools.two_card_groups
             )
-            if min_one is not None and min_one == min_two:
-                groups = tuple(
-                    group for group in pools.two_card_groups
-                    if group.negative_card_increase == min_two
-                )
-                selected_group, selected = _choose_grouped_candidate(
-                    groups, rng=rng
-                )
-                return _choice(
-                    selected, selected_group, mode="random_min_loss_two_equal",
-                    probability=0.8, draw=draw, pools=pools,
-                    safe_one=safe_one, safe_two=safe_two,
-                    enumeration_seconds=enumeration_seconds,
-                )
-            branch_draw = rng.random()
-            if min_one is not None and branch_draw < 0.8:
-                groups = tuple(
-                    group for group in pools.one_card_groups
-                    if group.negative_card_increase == min_one
-                )
-                candidates = tuple(
-                    candidate for group in groups for candidate in group.candidates
-                )
-                selected = _heuristic_representative(state, candidates)
-                if selected is not None:
-                    selected_group = _find_group_for_candidate(pools, selected)
-                    return _choice(
-                        selected, selected_group, mode="heuristic_min_loss_one",
-                        probability=0.64, draw=branch_draw, pools=pools,
-                        safe_one=safe_one, safe_two=safe_two,
-                        enumeration_seconds=enumeration_seconds,
-                    )
-            groups = pools.two_card_groups
-            selected_group, selected = _choose_grouped_candidate(groups, rng=rng)
             return _choice(
-                selected, selected_group, mode="random_min_loss_two",
-                probability=0.16, draw=branch_draw, pools=pools,
-                safe_one=safe_one, safe_two=safe_two,
+                selected,
+                selected_group,
+                mode=mode,
+                probability=probability,
+                draw=draw,
+                pools=pools,
+                safe_one=safe_one,
+                safe_two=safe_two,
                 enumeration_seconds=enumeration_seconds,
             )
 
@@ -338,54 +314,28 @@ class ExploratoryValueNpc:
             )
 
         if not safe_one and not safe_two and pools.two_card_groups:
-            draw = rng.random()
-            if draw < RANDOM_TWO_WHEN_NO_SAFE_ONE_PROBABILITY:
-                action_group = rng.choice(pools.two_card_groups)
-                actions = rng.choice(action_group.outcomes)
-                selected = materialize_turn_candidate(
-                    state, actions, history=history
+            action_group, actions, mode, probability, draw = (
+                _choose_min_loss_one_or_two_actions(
+                    pools,
+                    starting_hand_size=starting_hand_size,
+                    rng=rng,
                 )
-                group = _materialized_action_group(
-                    action_group, selected
-                )
-                return _choice(
-                    selected,
-                    group,
-                    mode="random_min_loss_two",
-                    probability=(
-                        RANDOM_TWO_WHEN_NO_SAFE_ONE_PROBABILITY
-                    ),
-                    draw=draw,
-                    pools=pools,
-                    safe_one=safe_one,
-                    safe_two=safe_two,
-                    enumeration_seconds=monotonic() - started,
-                )
-            min_one = min((group.negative_card_increase for group in pools.one_card_groups), default=None)
-            min_two = min(group.negative_card_increase for group in pools.two_card_groups)
-            if min_one is not None and min_one == min_two:
-                groups = tuple(group for group in pools.two_card_groups if group.negative_card_increase == min_two)
-                action_group = rng.choice(groups)
-                actions = rng.choice(action_group.outcomes)
-                selected = materialize_turn_candidate(state, actions, history=history)
-                group = _materialized_action_group(action_group, selected)
-                return _choice(selected, group, mode="random_min_loss_two_equal", probability=0.8, draw=draw, pools=pools, safe_one=safe_one, safe_two=safe_two, enumeration_seconds=monotonic() - started)
-            branch_draw = rng.random()
-            if min_one is not None and branch_draw < 0.8:
-                groups = tuple(group for group in pools.one_card_groups if group.negative_card_increase == min_one)
-                outcomes = tuple(actions for group in groups for actions in group.outcomes)
-                actions = _heuristic_action_representative(state, outcomes)
-                if actions is not None:
-                    action_group = next(group for group in groups if actions in group.outcomes)
-                    selected = materialize_turn_candidate(state, actions, history=history)
-                    group = _materialized_action_group(action_group, selected)
-                    return _choice(selected, group, mode="heuristic_min_loss_one", probability=0.64, draw=branch_draw, pools=pools, safe_one=safe_one, safe_two=safe_two, enumeration_seconds=monotonic() - started)
-            groups = pools.two_card_groups
-            action_group = rng.choice(groups)
-            actions = rng.choice(action_group.outcomes)
-            selected = materialize_turn_candidate(state, actions, history=history)
+            )
+            selected = materialize_turn_candidate(
+                state, actions, history=history
+            )
             group = _materialized_action_group(action_group, selected)
-            return _choice(selected, group, mode="random_min_loss_two", probability=0.16, draw=branch_draw, pools=pools, safe_one=safe_one, safe_two=safe_two, enumeration_seconds=monotonic() - started)
+            return _choice(
+                selected,
+                group,
+                mode=mode,
+                probability=probability,
+                draw=draw,
+                pools=pools,
+                safe_one=safe_one,
+                safe_two=safe_two,
+                enumeration_seconds=monotonic() - started,
+            )
 
         baseline_candidates = []
         for groups in (pools.one_card_groups, pools.two_card_groups):
@@ -520,33 +470,6 @@ class ExploratoryValueNpc:
 
         if safe_one is None and two_keys:
             draw = rng.random()
-            if draw < RANDOM_TWO_WHEN_NO_SAFE_ONE_PROBABILITY:
-                group_key = rng.choice(two_keys)
-                group, group_enumerated = enumerate_best_turn_card_group(
-                    state,
-                    group_key,
-                    history=history,
-                    approximate_new_color_neighbor_limit=True,
-                )
-                enumerated += group_enumerated
-                if group is not None:
-                    selected = rng.choice(group.candidates)
-                    return _card_first_choice(
-                        selected,
-                        group,
-                        mode="random_min_loss_two",
-                        probability=(
-                            RANDOM_TWO_WHEN_NO_SAFE_ONE_PROBABILITY
-                        ),
-                        draw=draw,
-                        one_group_count=len(one_keys),
-                        two_group_count=len(two_keys),
-                        safe_one_found=False,
-                        safe_two_found=False,
-                        enumerated=enumerated,
-                        groups_examined=one_examined + 1,
-                        enumeration_seconds=monotonic() - started,
-                    )
 
         pools = enumerate_loss_safe_turn_pools(
             state,
@@ -815,6 +738,80 @@ def _find_group_for_candidate(
     raise AssertionError("selected candidate is not in grouped pools")
 
 
+def _min_loss_one_probability(starting_hand_size: int, gap: int | None) -> float:
+    if gap is not None and gap >= MIN_LOSS_ONE_TWO_GAP_FORCE_ONE:
+        return 1.0
+    return MIN_LOSS_ONE_PROBABILITY_BY_HAND.get(starting_hand_size, 0.0)
+
+
+def _choose_min_loss_one_or_two_grouped(
+    state: GameState,
+    pools,
+    *,
+    starting_hand_size: int,
+    rng: Random,
+) -> tuple[GroupedTurnCandidates, TurnCandidate, str, float, float]:
+    min_one = min(
+        (group.negative_card_increase for group in pools.one_card_groups),
+        default=None,
+    )
+    min_two = min(group.negative_card_increase for group in pools.two_card_groups)
+    gap = min_two - min_one if min_one is not None else None
+    probability = _min_loss_one_probability(starting_hand_size, gap)
+    draw = rng.random()
+    choose_one = min_one is not None and draw < probability
+    if choose_one:
+        groups = tuple(
+            group
+            for group in pools.one_card_groups
+            if group.negative_card_increase == min_one
+        )
+        mode = "random_min_loss_one"
+    else:
+        groups = tuple(
+            group
+            for group in pools.two_card_groups
+            if group.negative_card_increase == min_two
+        )
+        mode = "random_min_loss_two"
+    selected_group, selected = _choose_grouped_candidate(groups, rng=rng)
+    return selected_group, selected, mode, probability, draw
+
+
+def _choose_min_loss_one_or_two_actions(
+    pools,
+    *,
+    starting_hand_size: int,
+    rng: Random,
+):
+    min_one = min(
+        (group.negative_card_increase for group in pools.one_card_groups),
+        default=None,
+    )
+    min_two = min(group.negative_card_increase for group in pools.two_card_groups)
+    gap = min_two - min_one if min_one is not None else None
+    probability = _min_loss_one_probability(starting_hand_size, gap)
+    draw = rng.random()
+    choose_one = min_one is not None and draw < probability
+    if choose_one:
+        groups = tuple(
+            group
+            for group in pools.one_card_groups
+            if group.negative_card_increase == min_one
+        )
+        mode = "random_min_loss_one"
+    else:
+        groups = tuple(
+            group
+            for group in pools.two_card_groups
+            if group.negative_card_increase == min_two
+        )
+        mode = "random_min_loss_two"
+    action_group = rng.choice(groups)
+    actions = rng.choice(action_group.outcomes)
+    return action_group, actions, mode, probability, draw
+
+
 def choose_exploratory_refill(
     state: GameState, *, rng: Random
 ) -> tuple[RefillAction, dict[str, Any]]:
@@ -856,27 +853,15 @@ def choose_exploratory_refill(
             "selected_source": selected.source.value,
         }
 
-    if none_action not in legal_refills:
-        raise AssertionError("non-empty refill state must allow NONE")
     starting_hand_size = len(player.hand) + state.cards_played_this_turn
-    probability = (
-        LOW_HAND_NO_REFILL_PROBABILITY
-        if state.cards_played_this_turn == 2 and starting_hand_size <= 4
-        else NO_REFILL_PROBABILITY
-    )
-    draw = rng.random()
-    selected = none_action if draw < probability else deck_action
+    selected = deck_action
     return selected, {
         "type": "refill",
-        "refill_policy": (
-            "low_starting_hand_none_vs_deck"
-            if probability == LOW_HAND_NO_REFILL_PROBABILITY
-            else "standard_none_vs_deck"
-        ),
-        "eligible_no_refill": True,
+        "refill_policy": "always_deck_non_empty",
+        "eligible_no_refill": none_action in legal_refills,
         "starting_hand_size": starting_hand_size,
-        "no_refill_probability": probability,
-        "random_draw": draw,
+        "no_refill_probability": 0.0,
+        "random_draw": None,
         "selected_source": selected.source.value,
     }
 
@@ -920,6 +905,7 @@ def play_one_exploratory_game(
             )
         ):
             starting_hand_size = len(state.players[player_index].hand)
+            safe_one_counts, one_off_counts = rank_color_offset_counts(state)
             choice = npc.choose_turn(
                 state, tuple(history[-HISTORY_SIZE:]), rng=decision_rng
             )
@@ -990,6 +976,8 @@ def play_one_exploratory_game(
                     "two_group_count": choice.two_group_count,
                     "safe_one_group_count": choice.safe_one_group_count,
                     "safe_two_group_count": choice.safe_two_group_count,
+                    "safe_one_card_counts_by_player": safe_one_counts,
+                    "one_off_card_counts_by_player": one_off_counts,
                     "safe_group_counts_exact": (
                         choice.safe_group_counts_exact
                     ),
